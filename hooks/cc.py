@@ -315,6 +315,10 @@ def handle_touch(payload: dict) -> None:
     project = get_project(cwd)
     tf = team_file_path(project)
 
+    # Skip if no team file exists yet (session hasn't sent a prompt since cc was installed)
+    if not tf.exists():
+        return
+
     if file_path.startswith(cwd):
         file_path = file_path[len(cwd):].lstrip("/")
 
