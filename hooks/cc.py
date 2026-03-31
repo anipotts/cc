@@ -101,7 +101,13 @@ def read_live_sessions() -> list[dict]:
         if not pid_alive(pid):
             continue
         try:
-            data = json.loads(f.read_text())
+            raw = f.read_text()
+            # Claude Code pads PID files with null bytes on partial writes
+            raw = raw.rstrip("\x00").strip()
+            if not raw.endswith("}"):
+                raw = raw.rstrip().rstrip(",") + "}"
+            raw = re.sub(r",\s*}", "}", raw)
+            data = json.loads(raw)
             data["_pid"] = pid
             sessions.append(data)
         except (json.JSONDecodeError, OSError):
