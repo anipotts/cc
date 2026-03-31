@@ -118,13 +118,11 @@ function readLiveSessions(): Session[] {
     try {
       let raw = fs.readFileSync(path.join(SESSIONS_DIR, f), "utf-8").trim();
       // Fix truncated JSON from Claude Code's concurrent writes
+      // Files are often padded with null bytes and trailing commas
+      raw = raw.replace(/[\x00\s]+$/g, ""); // strip trailing nulls + whitespace
       if (!raw.endsWith("}")) {
-        // Try to salvage: find last complete key-value pair
-        const lastBrace = raw.lastIndexOf("}");
-        if (lastBrace > 0) raw = raw.slice(0, lastBrace + 1);
-        else continue; // hopeless
+        raw = raw.replace(/,\s*$/, "") + "}";
       }
-      // Remove trailing commas before closing brace
       raw = raw.replace(/,\s*}/g, "}");
       const data: SessionFile = JSON.parse(raw);
       let enrichFiles: string[] = [];
