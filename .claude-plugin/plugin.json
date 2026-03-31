@@ -8,6 +8,12 @@
   },
   "repository": "https://github.com/anipotts/cc",
   "license": "MIT",
+  "mcpServers": {
+    "cc": {
+      "command": "npx",
+      "args": ["tsx", "${CLAUDE_PLUGIN_ROOT}/server.ts"]
+    }
+  },
   "channels": [
     { "server": "cc" }
   ]
