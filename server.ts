@@ -153,11 +153,29 @@ function readLiveSessions(): Session[] {
 
 function findSession(query: string): Session | undefined {
   const sessions = readLiveSessions();
+
+  // Support "project:name" syntax (e.g., "spring:interactive", "cc:YEO")
+  if (query.includes(":")) {
+    const [proj, name] = query.split(":", 2);
+    return sessions.find(
+      (s) => path.basename(s.cwd) === proj && (s.name === name || s.kind === name)
+    );
+  }
+
+  // Exact name match (unique names like "DMS", "YEO")
+  const byName = sessions.filter((s) => s.name === query);
+  if (byName.length === 1) return byName[0];
+
+  // Case-insensitive unique match
+  const byNameCI = sessions.filter((s) => s.name?.toLowerCase() === query.toLowerCase());
+  if (byNameCI.length === 1) return byNameCI[0];
+
+  // Project name match (e.g., "spring" matches the session in ~/spring)
+  const byProj = sessions.filter((s) => path.basename(s.cwd) === query);
+  if (byProj.length === 1) return byProj[0];
+
+  // Session ID prefix or PID
   return (
-    sessions.find((s) => s.name === query) ||
-    sessions.find(
-      (s) => s.name?.toLowerCase() === query.toLowerCase()
-    ) ||
     sessions.find((s) => s.sessionId.startsWith(query)) ||
     sessions.find((s) => String(s.pid) === query)
   );
