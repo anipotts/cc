@@ -142,12 +142,12 @@ def test_roster_shows_peers_xml():
     })
     create_tmp_session("test-002")
     stdout, _, code = run_hook("roster", {"session_id": "test-002", "cwd": TEST_CWD, "user_prompt": "refactor"})
-    assert_test("roster:xml:exits_0", code == 0)
-    assert_test("roster:xml:has_roster_tag", "<cc-roster" in stdout)
-    assert_test("roster:xml:has_session_tag", "<session" in stdout)
-    assert_test("roster:xml:has_peer_name", TEST_PROJECT in stdout)
-    assert_test("roster:xml:has_files", "src/auth.ts" in stdout)
-    assert_test("roster:xml:has_close_tag", "</cc-roster>" in stdout)
+    assert_test("roster:fmt:exits_0", code == 0)
+    assert_test("roster:fmt:has_roster_tag", "[cc]" in stdout)
+    assert_test("roster:fmt:has_session_tag", "->" in stdout)
+    assert_test("roster:fmt:has_peer_name", TEST_PROJECT in stdout)
+    assert_test("roster:fmt:has_files", "src/auth.ts" in stdout)
+    assert_test("roster:fmt:has_arrow", "->" in stdout)
 
 
 def test_roster_file_conflict_xml():
@@ -166,7 +166,7 @@ def test_roster_file_conflict_xml():
     })
     create_tmp_session("test-cf")
     stdout, _, _ = run_hook("roster", {"session_id": "test-cf", "cwd": TEST_CWD, "user_prompt": "x"})
-    assert_test("roster:conflict:xml", "<file-conflict" in stdout and "hooks/cc.py" in stdout,
+    assert_test("roster:conflict:xml", "!!" in stdout and "hooks/cc.py" in stdout,
                 f"stdout: {stdout[:300]}")
 
 
@@ -229,7 +229,7 @@ def test_roster_unregistered_detection():
     create_tmp_session("unreg-001")
     create_tmp_session("test-unreg")
     stdout, _, _ = run_hook("roster", {"session_id": "test-unreg", "cwd": TEST_CWD, "user_prompt": "x"})
-    assert_test("roster:unreg:detected", "<cc-roster" in stdout, f"stdout: {stdout[:200]}")
+    assert_test("roster:unreg:detected", "[cc]" in stdout, f"stdout: {stdout[:200]}")
     assert_test("roster:unreg:placeholder", "no metadata yet" in stdout or "just started" in stdout)
 
 
@@ -371,7 +371,7 @@ def test_mailbox_receive():
         {"from": "sender", "text": "update your imports", "timestamp": "2026-03-31T05:30:00Z", "read": False, "summary": "import change"}
     ])
     stdout, _, _ = run_hook("roster", {"session_id": "mail-rx", "cwd": TEST_CWD, "user_prompt": "check"})
-    assert_test("mailbox:rx:has_tag", "<cc-messages" in stdout)
+    assert_test("mailbox:rx:has_tag", "[cc]" in stdout)
     assert_test("mailbox:rx:has_text", "update your imports" in stdout)
     assert_test("mailbox:rx:has_from", "sender" in stdout)
 

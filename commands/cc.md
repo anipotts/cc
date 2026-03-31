@@ -11,43 +11,41 @@ allowed-tools:
 
 # /cc — Multi-Session Awareness
 
-You are the cc plugin's command handler. The user typed `/cc` with these arguments: $ARGUMENTS
+The user typed `/cc` with: $ARGUMENTS
 
-## What to do
+## Rules for output
 
-### No arguments (`/cc`)
+- Output must be **clean and human-readable** — no XML, no raw JSON, no code blocks for data
+- Use simple text with arrows (→), bullets (•), and indentation
+- Keep it short and scannable
+- Show relative times ("5m ago"), not timestamps
 
-Call the `cc_roster` MCP tool to show a detailed roster of all active sessions.
+## No arguments — show roster
 
-If the MCP tool is not available, fall back to reading team files directly:
-
-```bash
-ls ~/.claude/cc/teams/*/config.json 2>/dev/null
-```
-
-For each team file, read it and display a formatted roster showing all members.
-
-### With a session name (`/cc <name>`)
-
-The user wants context from another session. First call `cc_roster` to verify the session exists, then find and read the last 30 messages from that session's JSONL transcript at:
+Call the `cc_peers` MCP tool. Format the result as a clean roster:
 
 ```
-~/.claude/projects/{project-dir-path}/sessions/{session-id}/transcript.jsonl
+cc — 3 sessions on 'vector-seo'
+
+  → vector-seo       main        editing: src/routes.ts, lib/seo.ts     5m ago
+                                  "fixing crawl endpoint"
+  → vector-seo-2     feat/api    editing: tests/api.test.ts             12m ago
+                                  "writing integration tests"
+
+  ⚠ Both touching src/routes.ts
 ```
 
-Summarize what that session has been doing.
+If the MCP tool is unavailable, scan `/tmp/claude-{uid}/` and read `~/.claude/cc/teams/*/config.json` directly.
 
-### With a session name and message (`/cc <name> <message>`)
+## With session name — pull context
 
-Call the `cc_send` MCP tool:
+`/cc <name>`: Find that session's ID from team files, then read the last 20 lines of their transcript at `~/.claude/projects/{path}/sessions/{id}/transcript.jsonl`. Summarize what they've been doing in 3-5 bullets.
+
+## With session name + message — send message
+
+`/cc <name> <message>`: Call `cc_send` MCP tool with:
 - `to`: the session name
 - `text`: the message
-- `summary`: a 5-10 word summary of the message
+- `summary`: auto-generate a 5-word summary
 
-Confirm: "Message sent to {name}. They'll see it on their next prompt."
-
-## Important
-
-- Prefer MCP tools (`cc_roster`, `cc_peers`, `cc_send`) over bash commands.
-- Liveness is determined by `/tmp/claude-{uid}/` directories. If a session's `/tmp` dir is gone, it's dead.
-- Keep output concise and scannable.
+Confirm: "Sent to {name} — they'll see it next prompt."
