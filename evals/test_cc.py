@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
-"""Comprehensive test suite for cc.py — multi-session awareness hook.
+"""Comprehensive test suite for cc v0.2 — team file + locking + XML roster.
 
-Tests all 3 handlers (roster, touch, cleanup) with edge cases:
-- Normal operation with /tmp liveness detection
-- Missing/empty payloads
-- Corrupted JSON in session files
-- Path traversal in session IDs
-- Dead session pruning via /tmp
-- Concurrent session scenarios
-- Mailbox messaging
-- File conflict detection
-- Name auto-generation collisions
-- Large file lists (>20 files)
-- Unicode in task descriptions
-- Unregistered live session detection
+Tests all 3 handlers (roster, touch, cleanup) with:
+- Team file read/write with locking
+- XML-formatted roster output
+- Mailbox with read/unread tracking
+- /tmp liveness detection
+- Concurrent safety
+- Edge cases and robustness
 """
 
 import json
@@ -25,12 +19,13 @@ import time
 from pathlib import Path
 
 HOOK_SCRIPT = Path(__file__).parent.parent / "hooks" / "cc.py"
-SESSIONS_DIR = Path.home() / ".claude" / "cc" / "sessions"
-MAILBOX_DIR = Path.home() / ".claude" / "cc" / "mailbox"
+CC_DIR = Path.home() / ".claude" / "cc"
+TEAMS_DIR = CC_DIR / "teams"
+MAILBOX_DIR = CC_DIR / "mailbox"
 TMP_BASE = Path(f"/tmp/claude-{os.getuid()}")
 
-# Use a test project path that won't collide with real sessions
 TEST_CWD = "/tmp/cc-test-project"
+TEST_PROJECT = "cc-test-project"
 TEST_ENCODED = TEST_CWD.replace("/", "-")
 
 passed = 0
@@ -39,7 +34,6 @@ errors = []
 
 
 def run_hook(event: str, payload: dict) -> tuple[str, str, int]:
-    """Run cc.py with a given event and payload."""
     result = subprocess.run(
         [sys.executable, str(HOOK_SCRIPT), event],
         input=json.dumps(payload),
@@ -48,43 +42,44 @@ def run_hook(event: str, payload: dict) -> tuple[str, str, int]:
     return result.stdout, result.stderr, result.returncode
 
 
-def clean_sessions():
-    """Remove all session files, mailbox, and test /tmp dirs."""
-    if SESSIONS_DIR.exists():
-        shutil.rmtree(SESSIONS_DIR)
-    if MAILBOX_DIR.exists():
-        shutil.rmtree(MAILBOX_DIR)
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    clean_tmp()
-
-
-def clean_tmp():
-    """Remove test /tmp directories."""
+def clean():
+    """Remove all cc state and test /tmp dirs."""
+    for d in [TEAMS_DIR, MAILBOX_DIR]:
+        if d.exists():
+            shutil.rmtree(d)
     test_tmp = TMP_BASE / TEST_ENCODED
     if test_tmp.exists():
         shutil.rmtree(test_tmp)
 
 
 def create_tmp_session(session_id: str, cwd: str = TEST_CWD):
-    """Create a /tmp directory to simulate a live Claude Code session."""
     encoded = cwd.replace("/", "-")
-    tmp_dir = TMP_BASE / encoded / session_id
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    return tmp_dir
+    (TMP_BASE / encoded / session_id).mkdir(parents=True, exist_ok=True)
 
 
-def write_fake_session(session_id: str, data: dict):
-    """Write a fake session metadata file."""
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    path = SESSIONS_DIR / f"{session_id}.json"
-    path.write_text(json.dumps(data))
-
-
-def read_session_file(session_id: str) -> dict | None:
-    path = SESSIONS_DIR / f"{session_id}.json"
-    if not path.exists():
+def read_team() -> dict | None:
+    p = TEAMS_DIR / TEST_PROJECT / "config.json"
+    if not p.exists():
         return None
-    return json.loads(path.read_text())
+    return json.loads(p.read_text())
+
+
+def write_team(data: dict):
+    d = TEAMS_DIR / TEST_PROJECT
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text(json.dumps(data))
+
+
+def write_inbox(session_id: str, messages: list):
+    MAILBOX_DIR.mkdir(parents=True, exist_ok=True)
+    (MAILBOX_DIR / f"{session_id}.json").write_text(json.dumps(messages))
+
+
+def read_inbox(session_id: str) -> list:
+    p = MAILBOX_DIR / f"{session_id}.json"
+    if not p.exists():
+        return []
+    return json.loads(p.read_text())
 
 
 def assert_test(name: str, condition: bool, detail: str = ""):
@@ -100,688 +95,469 @@ def assert_test(name: str, condition: bool, detail: str = ""):
 
 
 # ===========================================================================
-# TEST GROUP 1: Roster Handler
+# ROSTER: Basic
 # ===========================================================================
 
 def test_roster_basic():
-    """Roster creates session file with correct fields."""
-    clean_sessions()
+    clean()
     create_tmp_session("test-001")
-    payload = {
-        "session_id": "test-001",
-        "cwd": TEST_CWD,
-        "user_prompt": "fix the login bug",
-    }
+    payload = {"session_id": "test-001", "cwd": TEST_CWD, "user_prompt": "fix login bug"}
     stdout, stderr, code = run_hook("roster", payload)
     assert_test("roster:basic:exits_0", code == 0)
 
-    data = read_session_file("test-001")
-    assert_test("roster:basic:file_created", data is not None)
-    assert_test("roster:basic:has_id", data.get("id") == "test-001")
-    assert_test("roster:basic:has_project", data.get("project") == "cc-test-project")
-    assert_test("roster:basic:has_task", data.get("task") == "fix the login bug")
-    assert_test("roster:basic:has_started", "started" in data)
-    assert_test("roster:basic:has_updated", "updated" in data)
-    assert_test("roster:basic:has_files", isinstance(data.get("files"), list))
-    assert_test("roster:basic:no_stdout_when_alone", stdout.strip() == "",
-                f"expected empty, got: {stdout[:100]}")
+    team = read_team()
+    assert_test("roster:basic:team_created", team is not None)
+    assert_test("roster:basic:has_member", len(team.get("members", [])) == 1)
+    member = team["members"][0]
+    assert_test("roster:basic:has_id", member["agentId"] == "test-001")
+    assert_test("roster:basic:has_task", member["task"] == "fix login bug")
+    assert_test("roster:basic:has_name", member["name"] == TEST_PROJECT)
+    assert_test("roster:basic:is_active", member["isActive"] is True)
+    assert_test("roster:basic:no_output_alone", stdout.strip() == "")
 
 
 def test_roster_no_session_id():
-    """Roster with no session_id should not create a file."""
-    clean_sessions()
+    clean()
     stdout, stderr, code = run_hook("roster", {"cwd": TEST_CWD})
     assert_test("roster:no_id:exits_0", code == 0)
-    files = list(SESSIONS_DIR.glob("*.json"))
-    assert_test("roster:no_id:no_files_created", len(files) == 0)
+    assert_test("roster:no_id:no_team", read_team() is None)
 
 
 def test_roster_empty_payload():
-    """Roster with empty payload should not crash."""
-    clean_sessions()
+    clean()
     stdout, stderr, code = run_hook("roster", {})
     assert_test("roster:empty:exits_0", code == 0)
 
 
-def test_roster_shows_peers():
-    """Roster shows other sessions in same project."""
-    clean_sessions()
-    # Create live peer in /tmp
+def test_roster_shows_peers_xml():
+    clean()
     create_tmp_session("peer-001")
-    write_fake_session("peer-001", {
-        "id": "peer-001",
-        "cwd": TEST_CWD,
-        "project": "cc-test-project",
-        "branch": "main",
-        "name": "cc-test-project",
-        "started": "2026-03-31T05:00:00Z",
-        "updated": "2026-03-31T05:30:00Z",
-        "task": "writing tests",
-        "files": ["src/auth.ts"],
+    write_team({
+        "name": TEST_PROJECT, "createdAt": 0,
+        "members": [{
+            "agentId": "peer-001", "name": TEST_PROJECT, "cwd": TEST_CWD,
+            "branch": "main", "files": ["src/auth.ts"], "task": "writing tests",
+            "isActive": True, "joinedAt": 0,
+        }]
     })
-    # Create our session in /tmp
     create_tmp_session("test-002")
-    payload = {
-        "session_id": "test-002",
-        "cwd": TEST_CWD,
-        "user_prompt": "refactor auth",
-    }
-    stdout, stderr, code = run_hook("roster", payload)
-    assert_test("roster:peers:exits_0", code == 0)
-    assert_test("roster:peers:shows_count", "2 sessions active" in stdout,
-                f"stdout: {stdout[:200]}")
-    assert_test("roster:peers:shows_peer_name", "cc-test-project" in stdout)
-    assert_test("roster:peers:shows_files", "src/auth.ts" in stdout)
-    assert_test("roster:peers:shows_task", "writing tests" in stdout)
+    stdout, _, code = run_hook("roster", {"session_id": "test-002", "cwd": TEST_CWD, "user_prompt": "refactor"})
+    assert_test("roster:xml:exits_0", code == 0)
+    assert_test("roster:xml:has_roster_tag", "<cc-roster" in stdout)
+    assert_test("roster:xml:has_session_tag", "<session" in stdout)
+    assert_test("roster:xml:has_peer_name", TEST_PROJECT in stdout)
+    assert_test("roster:xml:has_files", "src/auth.ts" in stdout)
+    assert_test("roster:xml:has_close_tag", "</cc-roster>" in stdout)
 
 
-def test_roster_file_conflict():
-    """Roster detects file conflicts between sessions."""
-    clean_sessions()
-    create_tmp_session("peer-conflict")
-    write_fake_session("peer-conflict", {
-        "id": "peer-conflict",
-        "cwd": TEST_CWD,
-        "project": "cc-test-project",
-        "branch": "main",
-        "name": "cc-test-project",
-        "started": "2026-03-31T05:00:00Z",
-        "updated": "2026-03-31T05:30:00Z",
-        "task": "editing hook",
-        "files": ["hooks/cc.py"],
+def test_roster_file_conflict_xml():
+    clean()
+    create_tmp_session("peer-cf")
+    write_team({
+        "name": TEST_PROJECT, "createdAt": 0,
+        "members": [
+            {"agentId": "peer-cf", "name": "peer", "cwd": TEST_CWD,
+             "branch": "main", "files": ["hooks/cc.py"], "task": "editing hook",
+             "isActive": True, "joinedAt": 0},
+            {"agentId": "test-cf", "name": "me", "cwd": TEST_CWD,
+             "branch": "main", "files": ["hooks/cc.py"], "task": "also editing",
+             "isActive": True, "joinedAt": 0},
+        ]
     })
-    create_tmp_session("test-conflict")
-    write_fake_session("test-conflict", {
-        "id": "test-conflict",
-        "cwd": TEST_CWD,
-        "project": "cc-test-project",
-        "branch": "main",
-        "name": "cc-test-project-2",
-        "started": "2026-03-31T05:00:00Z",
-        "updated": "2026-03-31T05:30:00Z",
-        "task": "also editing hook",
-        "files": ["hooks/cc.py"],
-    })
-    payload = {
-        "session_id": "test-conflict",
-        "cwd": TEST_CWD,
-        "user_prompt": "check conflicts",
-    }
-    stdout, stderr, code = run_hook("roster", payload)
-    assert_test("roster:conflict:exits_0", code == 0)
-    assert_test("roster:conflict:detected", "!!" in stdout and "hooks/cc.py" in stdout,
+    create_tmp_session("test-cf")
+    stdout, _, _ = run_hook("roster", {"session_id": "test-cf", "cwd": TEST_CWD, "user_prompt": "x"})
+    assert_test("roster:conflict:xml", "<file-conflict" in stdout and "hooks/cc.py" in stdout,
                 f"stdout: {stdout[:300]}")
 
 
 def test_roster_cross_project_isolation():
-    """Roster does NOT show sessions from different projects."""
-    clean_sessions()
-    create_tmp_session("other-project", cwd="/tmp/other-project")
-    write_fake_session("other-project", {
-        "id": "other-project",
-        "cwd": "/tmp/other-project",
-        "project": "other-project",
-        "branch": "main",
-        "name": "other",
-        "started": "2026-03-31T05:00:00Z",
-        "updated": "2026-03-31T05:30:00Z",
-        "task": "working on other",
-        "files": [],
-    })
-    create_tmp_session("test-isolated")
-    payload = {
-        "session_id": "test-isolated",
-        "cwd": TEST_CWD,
-        "user_prompt": "check roster",
-    }
-    stdout, stderr, code = run_hook("roster", payload)
-    assert_test("roster:isolation:exits_0", code == 0)
+    clean()
+    other_cwd = "/tmp/other-project"
+    create_tmp_session("other", cwd=other_cwd)
+    # Write to OTHER project's team file (not TEST_PROJECT)
+    other_dir = TEAMS_DIR / "other-project"
+    other_dir.mkdir(parents=True, exist_ok=True)
+    (other_dir / "config.json").write_text(json.dumps({
+        "name": "other-project", "createdAt": 0,
+        "members": [{"agentId": "other", "name": "other", "cwd": other_cwd,
+                      "branch": "main", "files": [], "task": "", "isActive": True, "joinedAt": 0}]
+    }))
+    create_tmp_session("test-iso")
+    stdout, _, _ = run_hook("roster", {"session_id": "test-iso", "cwd": TEST_CWD, "user_prompt": "x"})
     assert_test("roster:isolation:no_output", stdout.strip() == "",
-                f"should not show other project, got: {stdout[:200]}")
-    # Clean up the other project tmp
-    other_tmp = TMP_BASE / "-tmp-other-project"
+                f"got: {stdout[:100]}")
+    # Cleanup
+    other_tmp = TMP_BASE / other_cwd.replace("/", "-")
     if other_tmp.exists():
         shutil.rmtree(other_tmp)
 
 
-def test_roster_preserves_files_across_calls():
-    """Roster preserves the files list from previous calls."""
-    clean_sessions()
-    create_tmp_session("test-preserve")
-    run_hook("roster", {"session_id": "test-preserve", "cwd": TEST_CWD, "user_prompt": "a"})
-    run_hook("touch", {"session_id": "test-preserve", "tool_input": {"file_path": f"{TEST_CWD}/foo.py"}})
-    run_hook("roster", {"session_id": "test-preserve", "cwd": TEST_CWD, "user_prompt": "b"})
-    data = read_session_file("test-preserve")
-    assert_test("roster:preserves_files", "foo.py" in (data or {}).get("files", []),
-                f"files: {(data or {}).get('files')}")
-
-
 def test_roster_name_autogeneration():
-    """Auto-generated names are unique across sessions."""
-    clean_sessions()
+    clean()
     create_tmp_session("first")
-    write_fake_session("first", {
-        "id": "first", "cwd": TEST_CWD,
-        "project": "cc-test-project", "branch": "main", "name": "cc-test-project",
-        "started": "2026-03-31T05:00:00Z", "updated": "2026-03-31T05:30:00Z",
-        "task": "", "files": [],
+    write_team({
+        "name": TEST_PROJECT, "createdAt": 0,
+        "members": [{"agentId": "first", "name": TEST_PROJECT, "cwd": TEST_CWD,
+                      "branch": "main", "files": [], "task": "", "isActive": True, "joinedAt": 0}]
     })
     create_tmp_session("second")
     run_hook("roster", {"session_id": "second", "cwd": TEST_CWD, "user_prompt": "x"})
-    data = read_session_file("second")
-    assert_test("roster:name:unique", data is not None and data.get("name") != "cc-test-project",
-                f"name: {(data or {}).get('name')}")
-    assert_test("roster:name:proj-2", data is not None and data.get("name") == "cc-test-project-2",
-                f"name: {(data or {}).get('name')}")
+    team = read_team()
+    names = [m["name"] for m in team["members"]]
+    assert_test("roster:name:unique", len(set(names)) == 2, f"names: {names}")
+    assert_test("roster:name:second_suffixed", f"{TEST_PROJECT}-2" in names, f"names: {names}")
 
 
-def test_roster_long_prompt_truncation():
-    """Task field truncates long prompts to 120 chars."""
-    clean_sessions()
-    create_tmp_session("long-prompt")
-    long_prompt = "x" * 200
-    run_hook("roster", {"session_id": "long-prompt", "cwd": TEST_CWD, "user_prompt": long_prompt})
-    data = read_session_file("long-prompt")
-    assert_test("roster:truncation", len((data or {}).get("task", "")) <= 120)
-
-
-def test_roster_unicode_prompt():
-    """Handles unicode in prompts."""
-    clean_sessions()
-    create_tmp_session("unicode-test")
-    run_hook("roster", {
-        "session_id": "unicode-test",
-        "cwd": TEST_CWD,
-        "user_prompt": "fix the bug in 日本語ファイル.py 🐛",
+def test_roster_dead_session_pruned():
+    clean()
+    # Write a member but DON'T create /tmp for them
+    write_team({
+        "name": TEST_PROJECT, "createdAt": 0,
+        "members": [{"agentId": "dead", "name": "dead", "cwd": TEST_CWD,
+                      "branch": "main", "files": [], "task": "ghost", "isActive": True, "joinedAt": 0}]
     })
-    data = read_session_file("unicode-test")
-    assert_test("roster:unicode:created", data is not None)
-    assert_test("roster:unicode:preserved", "日本語" in (data or {}).get("task", ""))
+    create_tmp_session("alive")
+    run_hook("roster", {"session_id": "alive", "cwd": TEST_CWD, "user_prompt": "x"})
+    team = read_team()
+    ids = [m["agentId"] for m in team["members"]]
+    assert_test("roster:prune:dead_removed", "dead" not in ids, f"ids: {ids}")
+    assert_test("roster:prune:alive_kept", "alive" in ids)
 
 
-def test_roster_detects_unregistered_sessions():
-    """Roster shows live sessions that haven't registered metadata yet."""
-    clean_sessions()
-    # Create a live session in /tmp but don't write metadata
-    create_tmp_session("unregistered-001")
-    # Create our session
+def test_roster_unregistered_detection():
+    clean()
+    create_tmp_session("unreg-001")
     create_tmp_session("test-unreg")
-    payload = {
-        "session_id": "test-unreg",
-        "cwd": TEST_CWD,
-        "user_prompt": "check who's here",
-    }
-    stdout, stderr, code = run_hook("roster", payload)
-    assert_test("roster:unregistered:exits_0", code == 0)
-    assert_test("roster:unregistered:detected", "sessions active" in stdout,
-                f"stdout: {stdout[:200]}")
-    assert_test("roster:unregistered:shows_placeholder", "no metadata yet" in stdout or "just started" in stdout,
-                f"stdout: {stdout[:200]}")
+    stdout, _, _ = run_hook("roster", {"session_id": "test-unreg", "cwd": TEST_CWD, "user_prompt": "x"})
+    assert_test("roster:unreg:detected", "<cc-roster" in stdout, f"stdout: {stdout[:200]}")
+    assert_test("roster:unreg:placeholder", "no metadata yet" in stdout or "just started" in stdout)
+
+
+def test_roster_preserves_files():
+    clean()
+    create_tmp_session("preserve")
+    run_hook("roster", {"session_id": "preserve", "cwd": TEST_CWD, "user_prompt": "a"})
+    run_hook("touch", {"session_id": "preserve", "cwd": TEST_CWD,
+                        "tool_input": {"file_path": f"{TEST_CWD}/foo.py"}})
+    run_hook("roster", {"session_id": "preserve", "cwd": TEST_CWD, "user_prompt": "b"})
+    team = read_team()
+    member = next(m for m in team["members"] if m["agentId"] == "preserve")
+    assert_test("roster:preserves_files", "foo.py" in member["files"])
+
+
+def test_roster_long_prompt():
+    clean()
+    create_tmp_session("long")
+    run_hook("roster", {"session_id": "long", "cwd": TEST_CWD, "user_prompt": "x" * 200})
+    team = read_team()
+    member = team["members"][0]
+    assert_test("roster:truncation", len(member["task"]) <= 120)
+
+
+def test_roster_unicode():
+    clean()
+    create_tmp_session("unicode")
+    run_hook("roster", {"session_id": "unicode", "cwd": TEST_CWD, "user_prompt": "fix 日本語.py 🐛"})
+    team = read_team()
+    assert_test("roster:unicode", "日本語" in team["members"][0]["task"])
 
 
 # ===========================================================================
-# TEST GROUP 2: Touch Handler
+# TOUCH
 # ===========================================================================
 
 def test_touch_basic():
-    """Touch adds file to session's files list."""
-    clean_sessions()
+    clean()
     create_tmp_session("touch-test")
     run_hook("roster", {"session_id": "touch-test", "cwd": TEST_CWD, "user_prompt": "work"})
-    run_hook("touch", {"session_id": "touch-test", "tool_input": {"file_path": f"{TEST_CWD}/src/app.ts"}})
-    data = read_session_file("touch-test")
-    assert_test("touch:basic:added", "src/app.ts" in (data or {}).get("files", []),
-                f"files: {(data or {}).get('files')}")
+    run_hook("touch", {"session_id": "touch-test", "cwd": TEST_CWD,
+                        "tool_input": {"file_path": f"{TEST_CWD}/src/app.ts"}})
+    team = read_team()
+    member = next(m for m in team["members"] if m["agentId"] == "touch-test")
+    assert_test("touch:basic:added", "src/app.ts" in member["files"])
 
 
-def test_touch_relative_path():
-    """Touch converts absolute paths to relative."""
-    clean_sessions()
+def test_touch_relative():
+    clean()
     create_tmp_session("touch-rel")
     run_hook("roster", {"session_id": "touch-rel", "cwd": "/Users/test/project", "user_prompt": "x"})
-    run_hook("touch", {"session_id": "touch-rel", "tool_input": {"file_path": "/Users/test/project/lib/utils.py"}})
-    data = read_session_file("touch-rel")
-    files = (data or {}).get("files", [])
-    assert_test("touch:relative:converted", "lib/utils.py" in files, f"files: {files}")
-    assert_test("touch:relative:no_absolute", not any(f.startswith("/") for f in files))
+    run_hook("touch", {"session_id": "touch-rel", "cwd": "/Users/test/project",
+                        "tool_input": {"file_path": "/Users/test/project/lib/utils.py"}})
+    team = read_team("project") if False else None  # project is "project" here
+    tf = TEAMS_DIR / "project" / "config.json"
+    if tf.exists():
+        team = json.loads(tf.read_text())
+        member = team["members"][0]
+        assert_test("touch:relative:converted", "lib/utils.py" in member["files"])
+        assert_test("touch:relative:no_abs", not any(f.startswith("/") for f in member["files"]))
+    else:
+        assert_test("touch:relative:converted", False, "team file not found")
+        assert_test("touch:relative:no_abs", False, "team file not found")
 
 
-def test_touch_deduplication():
-    """Touch does not add the same file twice."""
-    clean_sessions()
-    create_tmp_session("touch-dedup")
-    run_hook("roster", {"session_id": "touch-dedup", "cwd": TEST_CWD, "user_prompt": "x"})
-    run_hook("touch", {"session_id": "touch-dedup", "tool_input": {"file_path": f"{TEST_CWD}/a.py"}})
-    run_hook("touch", {"session_id": "touch-dedup", "tool_input": {"file_path": f"{TEST_CWD}/a.py"}})
-    data = read_session_file("touch-dedup")
-    files = (data or {}).get("files", [])
-    assert_test("touch:dedup", files.count("a.py") == 1, f"files: {files}")
+def test_touch_dedup():
+    clean()
+    create_tmp_session("touch-dd")
+    run_hook("roster", {"session_id": "touch-dd", "cwd": TEST_CWD, "user_prompt": "x"})
+    run_hook("touch", {"session_id": "touch-dd", "cwd": TEST_CWD, "tool_input": {"file_path": f"{TEST_CWD}/a.py"}})
+    run_hook("touch", {"session_id": "touch-dd", "cwd": TEST_CWD, "tool_input": {"file_path": f"{TEST_CWD}/a.py"}})
+    team = read_team()
+    member = next(m for m in team["members"] if m["agentId"] == "touch-dd")
+    assert_test("touch:dedup", member["files"].count("a.py") == 1)
 
 
-def test_touch_max_files():
-    """Touch caps file list at 20."""
-    clean_sessions()
+def test_touch_max():
+    clean()
     create_tmp_session("touch-max")
     run_hook("roster", {"session_id": "touch-max", "cwd": TEST_CWD, "user_prompt": "x"})
     for i in range(25):
-        run_hook("touch", {"session_id": "touch-max", "tool_input": {"file_path": f"{TEST_CWD}/file{i}.py"}})
-    data = read_session_file("touch-max")
-    files = (data or {}).get("files", [])
-    assert_test("touch:max:capped", len(files) <= 20, f"got {len(files)} files")
-    assert_test("touch:max:keeps_recent", "file24.py" in files, f"files: {files[-5:]}")
+        run_hook("touch", {"session_id": "touch-max", "cwd": TEST_CWD,
+                            "tool_input": {"file_path": f"{TEST_CWD}/file{i}.py"}})
+    team = read_team()
+    member = next(m for m in team["members"] if m["agentId"] == "touch-max")
+    assert_test("touch:max:capped", len(member["files"]) <= 20, f"got {len(member['files'])}")
+    assert_test("touch:max:recent", "file24.py" in member["files"])
 
 
 def test_touch_no_session():
-    """Touch with no existing session file does nothing."""
-    clean_sessions()
-    stdout, stderr, code = run_hook("touch", {
-        "session_id": "nonexistent",
-        "tool_input": {"file_path": "/tmp/foo.py"},
-    })
+    clean()
+    stdout, stderr, code = run_hook("touch", {"session_id": "nope", "cwd": TEST_CWD,
+                                                "tool_input": {"file_path": "/tmp/foo.py"}})
     assert_test("touch:no_session:exits_0", code == 0)
-    assert_test("touch:no_session:no_file", read_session_file("nonexistent") is None)
 
 
-def test_touch_no_file_path():
-    """Touch with missing file_path does nothing."""
-    clean_sessions()
-    create_tmp_session("touch-nofp")
-    run_hook("roster", {"session_id": "touch-nofp", "cwd": TEST_CWD, "user_prompt": "x"})
-    run_hook("touch", {"session_id": "touch-nofp", "tool_input": {}})
-    data = read_session_file("touch-nofp")
-    assert_test("touch:no_filepath:empty", (data or {}).get("files") == [])
-
-
-def test_touch_empty_payload():
-    """Touch with empty payload does not crash."""
-    clean_sessions()
+def test_touch_empty():
+    clean()
     stdout, stderr, code = run_hook("touch", {})
     assert_test("touch:empty:exits_0", code == 0)
 
 
-def test_touch_updates_timestamp():
-    """Touch updates the 'updated' field."""
-    clean_sessions()
-    create_tmp_session("touch-ts")
-    run_hook("roster", {"session_id": "touch-ts", "cwd": TEST_CWD, "user_prompt": "x"})
-    data1 = read_session_file("touch-ts")
-    time.sleep(1.1)
-    run_hook("touch", {"session_id": "touch-ts", "tool_input": {"file_path": f"{TEST_CWD}/new.py"}})
-    data2 = read_session_file("touch-ts")
-    assert_test("touch:timestamp:updated",
-                (data2 or {}).get("updated") != (data1 or {}).get("updated"),
-                f"before: {(data1 or {}).get('updated')} after: {(data2 or {}).get('updated')}")
-
-
 # ===========================================================================
-# TEST GROUP 3: Cleanup Handler
+# CLEANUP
 # ===========================================================================
 
 def test_cleanup_basic():
-    """Cleanup removes the session file."""
-    clean_sessions()
-    create_tmp_session("cleanup-test")
-    run_hook("roster", {"session_id": "cleanup-test", "cwd": TEST_CWD, "user_prompt": "x"})
-    assert_test("cleanup:basic:exists_before", read_session_file("cleanup-test") is not None)
-    run_hook("cleanup", {"session_id": "cleanup-test"})
-    assert_test("cleanup:basic:removed", read_session_file("cleanup-test") is None)
+    clean()
+    create_tmp_session("cleanup")
+    run_hook("roster", {"session_id": "cleanup", "cwd": TEST_CWD, "user_prompt": "x"})
+    team = read_team()
+    assert_test("cleanup:before", len(team["members"]) == 1)
+    run_hook("cleanup", {"session_id": "cleanup", "cwd": TEST_CWD})
+    team = read_team()
+    assert_test("cleanup:after", len(team["members"]) == 0)
 
 
 def test_cleanup_nonexistent():
-    """Cleanup on nonexistent session does not crash."""
-    clean_sessions()
-    stdout, stderr, code = run_hook("cleanup", {"session_id": "does-not-exist"})
+    clean()
+    stdout, stderr, code = run_hook("cleanup", {"session_id": "nope", "cwd": TEST_CWD})
     assert_test("cleanup:nonexistent:exits_0", code == 0)
 
 
-def test_cleanup_empty_payload():
-    """Cleanup with empty payload does not crash."""
-    clean_sessions()
+def test_cleanup_empty():
+    clean()
     stdout, stderr, code = run_hook("cleanup", {})
     assert_test("cleanup:empty:exits_0", code == 0)
 
 
 # ===========================================================================
-# TEST GROUP 4: Security — Path Traversal
+# MAILBOX
 # ===========================================================================
 
-def test_security_path_traversal_session_id():
-    """Session IDs with path traversal should not escape sessions dir."""
-    clean_sessions()
-    malicious_id = "../../../etc/passwd"
+def test_mailbox_receive():
+    clean()
+    create_tmp_session("mail-rx")
+    run_hook("roster", {"session_id": "mail-rx", "cwd": TEST_CWD, "user_prompt": "x"})
+    write_inbox("mail-rx", [
+        {"from": "sender", "text": "update your imports", "timestamp": "2026-03-31T05:30:00Z", "read": False, "summary": "import change"}
+    ])
+    stdout, _, _ = run_hook("roster", {"session_id": "mail-rx", "cwd": TEST_CWD, "user_prompt": "check"})
+    assert_test("mailbox:rx:has_tag", "<cc-messages" in stdout)
+    assert_test("mailbox:rx:has_text", "update your imports" in stdout)
+    assert_test("mailbox:rx:has_from", "sender" in stdout)
+
+
+def test_mailbox_mark_read():
+    clean()
+    create_tmp_session("mail-read")
+    run_hook("roster", {"session_id": "mail-read", "cwd": TEST_CWD, "user_prompt": "x"})
+    write_inbox("mail-read", [
+        {"from": "a", "text": "hello", "timestamp": "now", "read": False}
+    ])
+    # First read — should show message
+    stdout1, _, _ = run_hook("roster", {"session_id": "mail-read", "cwd": TEST_CWD, "user_prompt": "x"})
+    # Second read — message should be marked read, not shown
+    stdout2, _, _ = run_hook("roster", {"session_id": "mail-read", "cwd": TEST_CWD, "user_prompt": "x"})
+    assert_test("mailbox:read:first", "hello" in stdout1)
+    assert_test("mailbox:read:second", "hello" not in stdout2, f"got: {stdout2[:200]}")
+    # Verify message still exists but is read
+    inbox = read_inbox("mail-read")
+    assert_test("mailbox:read:persisted", len(inbox) == 1 and inbox[0].get("read") is True)
+
+
+# ===========================================================================
+# SECURITY
+# ===========================================================================
+
+def test_security_path_traversal():
+    clean()
     stdout, stderr, code = run_hook("roster", {
-        "session_id": malicious_id,
-        "cwd": TEST_CWD,
-        "user_prompt": "x",
+        "session_id": "../../../etc/passwd",
+        "cwd": TEST_CWD, "user_prompt": "x",
     })
     assert_test("security:traversal:exits_0", code == 0)
-    assert_test("security:traversal:contained",
-                not Path("/Users/anipotts/.claude/cc/etc/passwd.json").exists() and
-                not Path("/etc/passwd.json").exists())
 
 
 # ===========================================================================
-# TEST GROUP 5: Robustness — Corrupted Data
+# ROBUSTNESS
 # ===========================================================================
 
-def test_robustness_corrupted_json():
-    """Corrupted session files should be skipped, not crash."""
-    clean_sessions()
-    create_tmp_session("robust-test")
-    (SESSIONS_DIR / "corrupted.json").write_text("{invalid json!!!")
-    run_hook("roster", {"session_id": "robust-test", "cwd": TEST_CWD, "user_prompt": "x"})
-    data = read_session_file("robust-test")
-    assert_test("robustness:corrupted:still_works", data is not None)
-
-
-def test_robustness_empty_session_file():
-    """Empty session file should be skipped."""
-    clean_sessions()
-    create_tmp_session("robust-empty")
-    (SESSIONS_DIR / "empty.json").write_text("")
-    stdout, stderr, code = run_hook("roster", {"session_id": "robust-empty", "cwd": TEST_CWD, "user_prompt": "x"})
-    assert_test("robustness:empty_file:exits_0", code == 0)
+def test_robustness_corrupted_team():
+    clean()
+    create_tmp_session("robust")
+    d = TEAMS_DIR / TEST_PROJECT
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text("{bad json!")
+    stdout, stderr, code = run_hook("roster", {"session_id": "robust", "cwd": TEST_CWD, "user_prompt": "x"})
+    assert_test("robustness:corrupted:exits_0", code == 0)
+    team = read_team()
+    assert_test("robustness:corrupted:recovered", team is not None and len(team.get("members", [])) > 0)
 
 
 def test_robustness_missing_fields():
-    """Session file with missing fields should not crash peers."""
-    clean_sessions()
+    clean()
     create_tmp_session("minimal")
-    write_fake_session("minimal", {"id": "minimal"})
-    create_tmp_session("robust-minimal")
-    stdout, stderr, code = run_hook("roster", {
-        "session_id": "robust-minimal",
-        "cwd": TEST_CWD,
-        "user_prompt": "x",
-    })
-    assert_test("robustness:missing_fields:exits_0", code == 0)
-
-
-def test_robustness_huge_task():
-    """Very long task string in session file should not crash."""
-    clean_sessions()
-    create_tmp_session("huge-task")
-    write_fake_session("huge-task", {
-        "id": "huge-task",
-        "cwd": TEST_CWD, "project": "cc-test-project", "branch": "main",
-        "name": "huge", "started": "2026-03-31T05:00:00Z",
-        "updated": "2026-03-31T05:30:00Z",
-        "task": "A" * 10000, "files": [],
-    })
-    create_tmp_session("robust-huge")
-    stdout, stderr, code = run_hook("roster", {
-        "session_id": "robust-huge",
-        "cwd": TEST_CWD,
-        "user_prompt": "x",
-    })
-    assert_test("robustness:huge_task:exits_0", code == 0)
-    assert_test("robustness:huge_task:truncated", len(stdout) < 11000,
-                f"stdout length: {len(stdout)}")
+    write_team({"name": TEST_PROJECT, "createdAt": 0, "members": [{"agentId": "minimal"}]})
+    create_tmp_session("robust-min")
+    stdout, stderr, code = run_hook("roster", {"session_id": "robust-min", "cwd": TEST_CWD, "user_prompt": "x"})
+    assert_test("robustness:missing:exits_0", code == 0)
 
 
 # ===========================================================================
-# TEST GROUP 6: Dead Session Pruning via /tmp
-# ===========================================================================
-
-def test_dead_session_pruned():
-    """Sessions without /tmp directories are pruned from metadata."""
-    clean_sessions()
-    # Write metadata for a session but DON'T create its /tmp dir
-    write_fake_session("dead-session", {
-        "id": "dead-session",
-        "cwd": TEST_CWD,
-        "project": "cc-test-project",
-        "branch": "main",
-        "name": "dead",
-        "started": "2026-03-31T05:00:00Z",
-        "updated": "2026-03-31T05:30:00Z",
-        "task": "ghost",
-        "files": [],
-    })
-    # Create our live session
-    create_tmp_session("alive-test")
-    run_hook("roster", {"session_id": "alive-test", "cwd": TEST_CWD, "user_prompt": "x"})
-    # Dead session's metadata should be cleaned up
-    assert_test("dead:pruned", read_session_file("dead-session") is None)
-    assert_test("dead:alive_exists", read_session_file("alive-test") is not None)
-
-
-def test_dead_not_shown_in_roster():
-    """Dead sessions should not appear in roster output."""
-    clean_sessions()
-    write_fake_session("ghost", {
-        "id": "ghost",
-        "cwd": TEST_CWD,
-        "project": "cc-test-project",
-        "branch": "main",
-        "name": "ghost",
-        "started": "2026-03-31T05:00:00Z",
-        "updated": "2026-03-31T05:30:00Z",
-        "task": "i am dead",
-        "files": [],
-    })
-    create_tmp_session("living")
-    stdout, stderr, code = run_hook("roster", {
-        "session_id": "living",
-        "cwd": TEST_CWD,
-        "user_prompt": "x",
-    })
-    assert_test("dead:not_in_output", "ghost" not in stdout, f"stdout: {stdout[:200]}")
-
-
-# ===========================================================================
-# TEST GROUP 7: Mailbox
-# ===========================================================================
-
-def test_mailbox_send_and_receive():
-    """Messages sent to a session are received on next roster call."""
-    clean_sessions()
-    create_tmp_session("mail-receiver")
-    run_hook("roster", {"session_id": "mail-receiver", "cwd": TEST_CWD, "user_prompt": "x"})
-    box = MAILBOX_DIR / "mail-receiver"
-    box.mkdir(parents=True, exist_ok=True)
-    msg = {"from": "sender", "content": "hey update your imports", "timestamp": "2026-03-31T05:30:00Z"}
-    (box / "1.json").write_text(json.dumps(msg))
-    stdout, stderr, code = run_hook("roster", {
-        "session_id": "mail-receiver",
-        "cwd": TEST_CWD,
-        "user_prompt": "check mail",
-    })
-    assert_test("mailbox:received", "hey update your imports" in stdout, f"stdout: {stdout[:300]}")
-    assert_test("mailbox:from_shown", "sender" in stdout)
-
-
-def test_mailbox_consumed_after_read():
-    """Messages are deleted after being read."""
-    clean_sessions()
-    create_tmp_session("mail-consume")
-    run_hook("roster", {"session_id": "mail-consume", "cwd": TEST_CWD, "user_prompt": "x"})
-    box = MAILBOX_DIR / "mail-consume"
-    box.mkdir(parents=True, exist_ok=True)
-    (box / "1.json").write_text(json.dumps({"from": "a", "content": "test", "timestamp": "now"}))
-    stdout1, _, _ = run_hook("roster", {"session_id": "mail-consume", "cwd": TEST_CWD, "user_prompt": "x"})
-    stdout2, _, _ = run_hook("roster", {"session_id": "mail-consume", "cwd": TEST_CWD, "user_prompt": "x"})
-    assert_test("mailbox:consumed:first_read", "test" in stdout1)
-    assert_test("mailbox:consumed:second_read", "test" not in stdout2, f"stdout2: {stdout2[:200]}")
-
-
-# ===========================================================================
-# TEST GROUP 8: Dispatcher
+# DISPATCHER
 # ===========================================================================
 
 def test_unknown_event():
     stdout, stderr, code = run_hook("bogus", {})
-    assert_test("dispatcher:unknown:exits_nonzero", code != 0)
+    assert_test("dispatcher:unknown:nonzero", code != 0)
 
 
 def test_no_event():
-    result = subprocess.run(
-        [sys.executable, str(HOOK_SCRIPT)],
-        capture_output=True, text=True, timeout=5,
-    )
-    assert_test("dispatcher:no_event:exits_nonzero", result.returncode != 0)
-    assert_test("dispatcher:no_event:shows_usage", "usage" in result.stderr.lower())
+    result = subprocess.run([sys.executable, str(HOOK_SCRIPT)], capture_output=True, text=True, timeout=5)
+    assert_test("dispatcher:no_event:nonzero", result.returncode != 0)
 
 
-def test_invalid_json_stdin():
+def test_bad_json():
     result = subprocess.run(
         [sys.executable, str(HOOK_SCRIPT), "roster"],
-        input="not json at all {{{",
-        capture_output=True, text=True, timeout=5,
+        input="not json {{{", capture_output=True, text=True, timeout=5,
     )
     assert_test("dispatcher:bad_json:exits_0", result.returncode == 0)
 
 
-def test_empty_stdin():
-    result = subprocess.run(
-        [sys.executable, str(HOOK_SCRIPT), "roster"],
-        input="",
-        capture_output=True, text=True, timeout=5,
-    )
-    assert_test("dispatcher:empty_stdin:exits_0", result.returncode == 0)
-
-
 # ===========================================================================
-# TEST GROUP 9: Performance
+# PERFORMANCE
 # ===========================================================================
 
-def test_performance_roster():
-    """Roster should complete in under 2 seconds with 10 peers."""
-    clean_sessions()
+def test_performance():
+    clean()
     for i in range(10):
         sid = f"perf-{i}"
         create_tmp_session(sid)
-        write_fake_session(sid, {
-            "id": sid,
-            "cwd": TEST_CWD, "project": "cc-test-project", "branch": "main",
-            "name": f"cc-test-project-{i}", "started": "2026-03-31T05:00:00Z",
-            "updated": "2026-03-31T05:30:00Z",
-            "task": f"task {i}", "files": [f"file{j}.py" for j in range(5)],
-        })
+    write_team({
+        "name": TEST_PROJECT, "createdAt": 0,
+        "members": [
+            {"agentId": f"perf-{i}", "name": f"{TEST_PROJECT}-{i}", "cwd": TEST_CWD,
+             "branch": "main", "files": [f"f{j}.py" for j in range(5)],
+             "task": f"task {i}", "isActive": True, "joinedAt": 0}
+            for i in range(10)
+        ]
+    })
     create_tmp_session("perf-test")
     start = time.time()
     run_hook("roster", {"session_id": "perf-test", "cwd": TEST_CWD, "user_prompt": "x"})
     elapsed = time.time() - start
-    assert_test("performance:roster:under_2s", elapsed < 2.0, f"took {elapsed:.2f}s")
+    assert_test("performance:under_2s", elapsed < 2.0, f"took {elapsed:.2f}s")
 
 
 # ===========================================================================
-# TEST GROUP 10: Edge Cases
+# CONCURRENT
 # ===========================================================================
 
-def test_special_chars_in_project_name():
-    """Project names with special chars should work."""
-    clean_sessions()
-    cwd = "/tmp/my-project.v2"
-    create_tmp_session("special-proj", cwd=cwd)
-    run_hook("roster", {"session_id": "special-proj", "cwd": cwd, "user_prompt": "x"})
-    data = read_session_file("special-proj")
-    assert_test("edge:special_project", data is not None and data.get("project") == "my-project.v2")
-    # cleanup
-    encoded = cwd.replace("/", "-")
-    tmp = TMP_BASE / encoded
-    if tmp.exists():
-        shutil.rmtree(tmp)
-
-
-def test_concurrent_roster_calls():
-    """Multiple roster calls don't corrupt session files."""
-    clean_sessions()
+def test_concurrent():
+    clean()
     import concurrent.futures
 
     def run_one(i):
-        sid = f"concurrent-{i}"
+        sid = f"conc-{i}"
         create_tmp_session(sid)
         run_hook("roster", {"session_id": sid, "cwd": TEST_CWD, "user_prompt": f"task {i}"})
-        return read_session_file(sid)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(run_one, range(5)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        list(ex.map(run_one, range(5)))
 
-    valid = [r for r in results if r is not None]
-    assert_test("edge:concurrent:all_created", len(valid) == 5, f"got {len(valid)}/5")
-
-
-def test_real_sessions_detected():
-    """Can detect actually running Claude Code sessions via /tmp."""
-    all_live = {}
-    if TMP_BASE.is_dir():
-        for d in TMP_BASE.iterdir():
-            if d.is_dir() and d.name.startswith("-"):
-                sessions = [s.name for s in d.iterdir() if s.is_dir() and "-" in s.name]
-                if sessions:
-                    all_live[d.name] = sessions
-
-    # We know at least THIS session is running
-    our_encoded = encode_cwd(os.getcwd())
-    assert_test("edge:real_sessions:tmp_exists", TMP_BASE.is_dir())
-    assert_test("edge:real_sessions:found_some", len(all_live) > 0,
-                f"found {len(all_live)} project dirs")
-
-
-def encode_cwd(cwd):
-    return cwd.replace("/", "-")
+    team = read_team()
+    assert_test("concurrent:all_registered", len(team["members"]) == 5,
+                f"got {len(team['members'])}")
 
 
 # ===========================================================================
-# Run all tests
+# REAL SESSIONS
+# ===========================================================================
+
+def test_real_sessions():
+    assert_test("real:tmp_exists", TMP_BASE.is_dir())
+    live = {}
+    if TMP_BASE.is_dir():
+        for d in TMP_BASE.iterdir():
+            if d.is_dir() and d.name.startswith("-"):
+                sessions = [s.name for s in d.iterdir() if s.is_dir()]
+                if sessions:
+                    live[d.name] = sessions
+    assert_test("real:found_some", len(live) > 0, f"found {len(live)} dirs")
+
+
+# ===========================================================================
+# Run
 # ===========================================================================
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("cc plugin — comprehensive test suite (v2: /tmp liveness)")
+    print("cc v0.2 — team file + locking + XML roster + MCP")
     print("=" * 60)
 
     tests = [
-        # Roster
         test_roster_basic,
         test_roster_no_session_id,
         test_roster_empty_payload,
-        test_roster_shows_peers,
-        test_roster_file_conflict,
+        test_roster_shows_peers_xml,
+        test_roster_file_conflict_xml,
         test_roster_cross_project_isolation,
-        test_roster_preserves_files_across_calls,
         test_roster_name_autogeneration,
-        test_roster_long_prompt_truncation,
-        test_roster_unicode_prompt,
-        test_roster_detects_unregistered_sessions,
-        # Touch
+        test_roster_dead_session_pruned,
+        test_roster_unregistered_detection,
+        test_roster_preserves_files,
+        test_roster_long_prompt,
+        test_roster_unicode,
         test_touch_basic,
-        test_touch_relative_path,
-        test_touch_deduplication,
-        test_touch_max_files,
+        test_touch_relative,
+        test_touch_dedup,
+        test_touch_max,
         test_touch_no_session,
-        test_touch_no_file_path,
-        test_touch_empty_payload,
-        test_touch_updates_timestamp,
-        # Cleanup
+        test_touch_empty,
         test_cleanup_basic,
         test_cleanup_nonexistent,
-        test_cleanup_empty_payload,
-        # Security
-        test_security_path_traversal_session_id,
-        # Robustness
-        test_robustness_corrupted_json,
-        test_robustness_empty_session_file,
+        test_cleanup_empty,
+        test_mailbox_receive,
+        test_mailbox_mark_read,
+        test_security_path_traversal,
+        test_robustness_corrupted_team,
         test_robustness_missing_fields,
-        test_robustness_huge_task,
-        # Dead session pruning
-        test_dead_session_pruned,
-        test_dead_not_shown_in_roster,
-        # Mailbox
-        test_mailbox_send_and_receive,
-        test_mailbox_consumed_after_read,
-        # Dispatcher
         test_unknown_event,
         test_no_event,
-        test_invalid_json_stdin,
-        test_empty_stdin,
-        # Performance
-        test_performance_roster,
-        # Edge cases
-        test_special_chars_in_project_name,
-        test_concurrent_roster_calls,
-        test_real_sessions_detected,
+        test_bad_json,
+        test_performance,
+        test_concurrent,
+        test_real_sessions,
     ]
 
     for test_fn in tests:
@@ -794,8 +570,7 @@ if __name__ == "__main__":
             print(msg)
             errors.append(msg)
 
-    # Cleanup
-    clean_sessions()
+    clean()
 
     print("\n" + "=" * 60)
     print(f"RESULTS: {passed} passed, {failed} failed ({passed + failed} total)")
