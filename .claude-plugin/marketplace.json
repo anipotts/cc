@@ -1,0 +1,20 @@
+{
+  "name": "cc",
+  "owner": {
+    "name": "Ani Potts"
+  },
+  "metadata": {
+    "description": "multi-session awareness for claude code",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "cc",
+      "source": "./",
+      "description": "multi-session awareness — see other sessions, file conflict warnings, cross-session messaging",
+      "author": { "name": "Ani Potts" },
+      "license": "MIT",
+      "category": "collaboration"
+    }
+  ]
+}
