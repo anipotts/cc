@@ -1,6 +1,7 @@
 ---
 description: See active Claude Code sessions and communicate across them
 argument-hint: [session-name] [message]
+model: haiku
 allowed-tools:
   - Bash
   - Read
