@@ -82,13 +82,17 @@ function readLiveSessions(): Session[] {
   return sessions;
 }
 
-function findByName(name: string): Session | undefined {
-  return readLiveSessions().find(s => s.name === name);
+function findSession(query: string): Session | undefined {
+  const sessions = readLiveSessions();
+  return sessions.find(s => s.name === query)
+    || sessions.find(s => s.name?.toLowerCase() === query.toLowerCase())
+    || sessions.find(s => s.sessionId.startsWith(query))
+    || sessions.find(s => String(s.pid) === query);
 }
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "cc", version: "0.4.0" });
+const server = new McpServer({ name: "cc", version: "0.5.0" });
 
 server.tool(
   "cc_peers",
@@ -177,7 +181,7 @@ server.tool(
     summary: z.string().optional().describe("5-10 word preview"),
   },
   async ({ to, text, summary }) => {
-    const target = findByName(to);
+    const target = findSession(to);
     if (!target) {
       return { content: [{ type: "text" as const, text: `Session '${to}' not found. Use cc_peers to see available sessions.` }] };
     }
