@@ -1,153 +1,87 @@
 #!/usr/bin/env bash
-# cc roster — instant multi-session overview
+# cc roster — reads Claude Code's native session registry
 # Usage: bash roster.sh [cwd]
-# Scans /tmp/claude-{uid}/ for live sessions, enriches with team file metadata.
 
-uid=$(id -u)
-base="/tmp/claude-${uid}"
+claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+sessions_dir="${claude_dir}/sessions"
+enrich_dir="${claude_dir}/cc/enrich"
 my_cwd="${1:-$(pwd)}"
 my_project=$(basename "$my_cwd")
-teams_dir="$HOME/.claude/cc/teams"
 
-[[ -d "$base" ]] || { echo "No active sessions."; exit 0; }
+[[ -d "$sessions_dir" ]] || { echo "No active sessions."; exit 0; }
 
-# --- Collect sessions from /tmp ---
-declare -A proj_count
-declare -A proj_encoded
-declare -A proj_worktrees
-total=0
+# Collect all live session data into a temp file (avoids bash 3 assoc array issues)
+tmpfile=$(mktemp)
+trap 'rm -f "$tmpfile"' EXIT
 
-for pdir in "$base"/-*/; do
-    [[ -d "$pdir" ]] || continue
-    enc=$(basename "$pdir")
-    count=0
-    for sdir in "$pdir"*/; do [[ -d "$sdir" ]] && ((count++)); done
-    (( count == 0 )) && continue
-    total=$((total + count))
+total=0; busy_total=0
 
-    is_wt=0
-    [[ "$enc" == *"claude-worktrees"* ]] && is_wt=1
+for sf in "$sessions_dir"/*.json; do
+    [[ -f "$sf" ]] || continue
+    pid=$(basename "$sf" .json)
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    ps -p "$pid" &>/dev/null || continue
+    ((total++))
 
-    # --- Resolve project name ---
-    # Strategy: try decoding the /tmp path back to a real directory.
-    # The encoding is cwd.replace("/", "-"), so we reverse it by trying
-    # progressively from the full path. This handles hyphens in dir names.
-    proj=""
-    if (( is_wt )); then
-        parent_enc="${enc%%--claude-worktrees*}"
-        wt_name="${enc##*claude-worktrees-}"
-    else
-        parent_enc="$enc"
+    name=$(jq -r '.name // .kind // "session"' "$sf" 2>/dev/null)
+    scwd=$(jq -r '.cwd // ""' "$sf" 2>/dev/null)
+    sid=$(jq -r '.sessionId // ""' "$sf" 2>/dev/null)
+    proj=$(basename "$scwd")
+
+    cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')
+    is_busy=0
+    (( $(echo "${cpu:-0} > 5" | bc 2>/dev/null || echo 0) )) && { is_busy=1; ((busy_total++)); }
+
+    files="" task=""
+    ef="${enrich_dir}/${sid}.json"
+    if [[ -f "$ef" ]]; then
+        files=$(jq -r '(.files // [])[-3:] | join(", ")' "$ef" 2>/dev/null)
+        task=$(jq -r '.task // ""' "$ef" 2>/dev/null)
     fi
 
-    # Resolve project name: check team files first (they store the real cwd),
-    # then try decoding the /tmp path, then fallback to last segment.
-    for tf in "$teams_dir"/*/config.json; do
-        [[ -f "$tf" ]] || continue
-        tf_cwd=$(jq -r '.members[0].cwd // empty' "$tf" 2>/dev/null)
-        [[ -z "$tf_cwd" ]] && continue
-        tf_enc=$(echo "$tf_cwd" | tr '/' '-')
-        if [[ "$tf_enc" == "$parent_enc" ]]; then
-            proj=$(basename "$tf_cwd")
-            break
-        fi
-    done
+    # Truncate
+    [[ ${#name} -gt 25 ]] && name="${name:0:22}..."
+    [[ ${#task} -gt 45 ]] && task="${task:0:42}..."
 
-    if [[ -z "$proj" ]]; then
-        # Try progressively joining last N segments as the basename
-        IFS='-' read -ra segs <<< "${parent_enc#-}"
-        n=${#segs[@]}
-        for join_count in 1 2 3; do
-            (( join_count > n )) && break
-            start=$((n - join_count))
-            candidate=$(IFS=-; echo "${segs[*]:$start}")
-            prefix_path="/"
-            for ((k=0; k<start; k++)); do prefix_path+="${segs[$k]}/"; done
-            if [[ -d "${prefix_path}${candidate}" ]]; then
-                proj="$candidate"
-                break
-            fi
-            # Also try with dots (for domain-style names like anipotts.com)
-            if (( join_count == 2 )); then
-                dot_candidate="${segs[$start]}.${segs[$((start+1))]}"
-                if [[ -d "${prefix_path}${dot_candidate}" ]]; then
-                    proj="$dot_candidate"
-                    break
-                fi
-            fi
-        done
-        [[ -z "$proj" ]] && proj="${segs[$((n-1))]}"
-    fi
+    status="·"; (( is_busy )) && status="▶"
 
-    # --- Aggregate ---
-    if (( is_wt )); then
-        # Find parent project and add worktree info
-        proj_worktrees["$proj"]+="${wt_name:-unknown} "
-        proj_count["$proj"]=$(( ${proj_count["$proj"]:-0} + count ))
-    else
-        proj_count["$proj"]=$(( ${proj_count["$proj"]:-0} + count ))
-    fi
-    proj_encoded["$proj"]+="$enc "
+    # Write to temp file: proj|status|name|files|task
+    echo "${proj}|${status}|${name}|${files}|${task}" >> "$tmpfile"
 done
 
 (( total == 0 )) && { echo "No active sessions."; exit 0; }
 
-echo "cc — ${total} sessions across ${#proj_count[@]} projects"
+idle_total=$((total - busy_total))
+echo "cc — ${total} sessions (${busy_total} busy, ${idle_total} idle)"
 echo ""
 
-# --- Sort: current project first, then by count descending ---
-sorted=()
-for proj in "${!proj_count[@]}"; do
-    [[ "$proj" == "$my_project" ]] && { sorted=("$proj" "${sorted[@]}"); continue; }
-    sorted+=("$proj")
-done
-
-if (( ${#sorted[@]} > 1 )); then
-    first="${sorted[0]}"
-    rest=()
-    for proj in $(for p in "${sorted[@]:1}"; do
-        echo "${proj_count[$p]} $p"
-    done | sort -rn | awk '{print $2}'); do
-        rest+=("$proj")
-    done
-    sorted=("$first" "${rest[@]}")
+# Get unique projects, current first
+projects=()
+if grep -q "^${my_project}|" "$tmpfile" 2>/dev/null; then
+    projects+=("$my_project")
 fi
+while IFS= read -r p; do
+    [[ "$p" != "$my_project" ]] && projects+=("$p")
+done < <(cut -d'|' -f1 "$tmpfile" | sort | uniq -c | sort -rn | awk '{print $2}')
 
-# --- Render ---
-for proj in "${sorted[@]}"; do
-    count=${proj_count[$proj]}
+for proj in "${projects[@]}"; do
+    entries=$(grep "^${proj}|" "$tmpfile")
+    count=$(echo "$entries" | wc -l | tr -d ' ')
     marker=""
     [[ "$proj" == "$my_project" ]] && marker="  ← YOU ARE HERE"
 
     echo "  ${proj} (${count})${marker}"
 
-    # Team file metadata
-    tf="${teams_dir}/${proj}/config.json"
-    if [[ -f "$tf" ]] && command -v jq &>/dev/null; then
-        mapfile -t members < <(jq -r '.members[]? | "\(.name // "?")\t\(.branch // "")\t\(.files // [] | .[-3:] | join(", "))\t\(.task // "")"' "$tf" 2>/dev/null)
-        nm=${#members[@]}
-        has_wt="${proj_worktrees[$proj]:-}"
-        for ((i=0; i<nm; i++)); do
-            IFS=$'\t' read -r name branch files task <<< "${members[$i]}"
-            conn="├"
-            (( i == nm - 1 )) && [[ -z "$has_wt" ]] && conn="└"
-            [[ ${#task} -gt 50 ]] && task="${task:0:50}…"
-            line="  ${conn} ${name}"
-            [[ -n "$branch" ]] && line+="  ${branch}"
-            [[ -n "$files" && "$files" != "null" && -n "$files" ]] && line+="  ${files}"
-            [[ -n "$task" ]] && line+="  \"${task}\""
-            echo "$line"
-        done
-    fi
-
-    # Worktrees
-    if [[ -n "${proj_worktrees[$proj]:-}" ]]; then
-        wts=(${proj_worktrees[$proj]})
-        for ((i=0; i<${#wts[@]}; i++)); do
-            conn="├"; (( i == ${#wts[@]} - 1 )) && conn="└"
-            echo "  ${conn} worktree  ${wts[$i]}"
-        done
-    fi
+    i=0
+    while IFS='|' read -r _proj status name files task; do
+        [[ -z "$name" || "$name" == "session" ]] && { ((i++)); continue; }
+        ((i++))
+        conn="├"; (( i >= count )) && conn="└"
+        line="  ${conn} ${status} ${name}"
+        [[ -n "$files" ]] && line+="  ${files}"
+        [[ -n "$task" ]] && line+="  \"${task}\""
+        echo "$line"
+    done <<< "$entries"
 
     echo ""
 done
