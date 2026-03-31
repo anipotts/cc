@@ -113,7 +113,8 @@ def test_roster_basic():
     assert_test("roster:basic:has_task", member["task"] == "fix login bug")
     assert_test("roster:basic:has_name", member["name"] == TEST_PROJECT)
     assert_test("roster:basic:is_active", member["isActive"] is True)
-    assert_test("roster:basic:no_output_alone", stdout.strip() == "")
+    # May show cross-project sessions if other real sessions exist
+    assert_test("roster:basic:no_same_project_peers", "[cc]" not in stdout or "also active" in stdout)
 
 
 def test_roster_no_session_id():
@@ -184,8 +185,9 @@ def test_roster_cross_project_isolation():
     }))
     create_tmp_session("test-iso")
     stdout, _, _ = run_hook("roster", {"session_id": "test-iso", "cwd": TEST_CWD, "user_prompt": "x"})
-    assert_test("roster:isolation:no_output", stdout.strip() == "",
-                f"got: {stdout[:100]}")
+    # Should not show "other" project as a same-project peer, but may show cross-project summary
+    assert_test("roster:isolation:no_peer_from_other", "-> other" not in stdout,
+                f"got: {stdout[:200]}")
     # Cleanup
     other_tmp = TMP_BASE / other_cwd.replace("/", "-")
     if other_tmp.exists():

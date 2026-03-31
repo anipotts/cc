@@ -306,7 +306,15 @@ def handle_roster(payload: dict) -> None:
     # Read unread messages
     messages = read_unread_messages(session_id)
 
-    if not peers and not messages:
+    # Also count sessions on OTHER projects (brief cross-project awareness)
+    all_live = get_all_live_sessions()
+    encoded = encode_cwd(cwd)
+    other_project_count = sum(
+        len(sids) for enc, sids in all_live.items()
+        if enc != encoded and enc != "claude-501"
+    )
+
+    if not peers and not messages and other_project_count == 0:
         return
 
     self_member = next((m for m in team["members"] if m["agentId"] == session_id), None)
@@ -331,6 +339,18 @@ def handle_roster(payload: dict) -> None:
             for cf in conflicts:
                 context(f"  !! {peer_name} is also touching {cf}")
 
+    # Cross-project summary (brief — just counts)
+    if other_project_count > 0:
+        other_projects = []
+        for enc, sids in all_live.items():
+            if enc != encoded and enc.startswith("-"):
+                # Extract project name (last segment of encoded path)
+                parts = enc.strip("-").split("-")
+                proj_name = parts[-1] if parts else enc
+                other_projects.append(f"{proj_name}({len(sids)})")
+        if other_projects:
+            context(f"[cc] also active: {', '.join(other_projects[:5])}")
+
     if messages:
         context(f"[cc] {len(messages)} message(s):")
         for msg in messages:
@@ -338,7 +358,6 @@ def handle_roster(payload: dict) -> None:
             text = msg.get("text", msg.get("content", ""))[:200]
             context(f"  <- {from_name}: {text}")
 
-        # Mark as read (not deleted)
         mark_messages_read(session_id)
 
 
