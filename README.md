@@ -1,12 +1,10 @@
-# cc
+# cc: Multi-session awareness for Claude Code CLI.
 
-Multi-session awareness for Claude Code.
-
-When you run multiple Claude Code sessions on the same machine, they don't know about each other. You end up manually relaying context between terminals. **cc** fixes that.
+When you run multiple Claude Code sessions on the same machine, they don't know about each other. You end up manually relaying context between terminals. **cc** fixes that using Claude Code's own `/tmp` directories.
 
 ## What it does
 
-Every time you send a prompt, cc tells your session who else is working:
+Every time you send a prompt, cc reminds your current session who else is working:
 
 ```
 [cc] 3 sessions active on 'vector-seo'
@@ -43,7 +41,7 @@ Every time you send a prompt, cc tells your session who else is working:
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Liveness detection** uses Claude Code's own `/tmp` directories. These directories exist only while a session is running — when it ends (or crashes), the directory disappears. No PIDs, no heartbeats, no TTLs. Instant and accurate.
+**Liveness detection** uses Claude Code's `/tmp` directories. These directories exist only while a session is running — when it ends (or crashes), the directory disappears. No PIDs, no heartbeats, no TTLs (near instant).
 
 **Metadata** (session name, files being edited, current task) is stored in `~/.claude/cc/sessions/` as one JSON file per session. Each session writes only its own file and reads everyone else's.
 
