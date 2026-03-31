@@ -166,7 +166,19 @@ def mark_messages_read(session_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def get_session_id(payload: dict) -> str:
-    return payload.get("session_id", os.environ.get("CLAUDE_SESSION_ID", ""))
+    """Get session ID from hook payload, env var, or /tmp scan (last resort)."""
+    sid = payload.get("session_id") or os.environ.get("CLAUDE_SESSION_ID", "")
+    if sid:
+        return sid
+    # Last resort: if we're in a project dir, find our session from /tmp
+    cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
+    encoded = encode_cwd(cwd)
+    tmp_dir = TMP_BASE / encoded
+    if tmp_dir.is_dir():
+        sessions = [s.name for s in tmp_dir.iterdir() if s.is_dir()]
+        if len(sessions) == 1:
+            return sessions[0]
+    return ""
 
 
 def get_cwd(payload: dict) -> str:
@@ -297,41 +309,34 @@ def handle_roster(payload: dict) -> None:
     if not peers and not messages:
         return
 
-    # Output XML roster (matches Anthropic's <teammate-message> injection pattern)
     self_member = next((m for m in team["members"] if m["agentId"] == session_id), None)
     my_files = set((self_member or {}).get("files", []))
     my_branch = (self_member or {}).get("branch", "")
 
     if peers:
-        context(f'<cc-roster project="{project}" sessions="{len(peers) + 1}">')
+        context(f"[cc] {len(peers) + 1} sessions on '{project}'")
         for peer in peers:
             peer_name = peer.get("name", "?")
             peer_branch = peer.get("branch", "")
             peer_files = peer.get("files", [])
             peer_task = peer.get("task", "")
 
-            branch_attr = f' branch="{peer_branch}"' if peer_branch and peer_branch != my_branch else ""
+            branch_tag = f" ({peer_branch})" if peer_branch and peer_branch != my_branch else ""
             files_str = ", ".join(peer_files[-3:]) if peer_files else "no files yet"
             task_str = f' — "{peer_task[:60]}"' if peer_task else ""
 
-            context(f'  <session name="{peer_name}"{branch_attr}>editing: {files_str}{task_str}</session>')
+            context(f"  -> {peer_name}{branch_tag} editing: {files_str}{task_str}")
 
-            # File conflict detection
             conflicts = my_files & set(peer_files)
             for cf in conflicts:
-                context(f'  <file-conflict file="{cf}" other="{peer_name}" />')
-
-        context("</cc-roster>")
+                context(f"  !! {peer_name} is also touching {cf}")
 
     if messages:
-        context(f'<cc-messages count="{len(messages)}">')
+        context(f"[cc] {len(messages)} message(s):")
         for msg in messages:
             from_name = msg.get("from", "?")
             text = msg.get("text", msg.get("content", ""))[:200]
-            summary = msg.get("summary", "")
-            summary_attr = f' summary="{summary}"' if summary else ""
-            context(f'  <message from="{from_name}"{summary_attr}>{text}</message>')
-        context("</cc-messages>")
+            context(f"  <- {from_name}: {text}")
 
         # Mark as read (not deleted)
         mark_messages_read(session_id)
