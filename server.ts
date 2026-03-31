@@ -27,8 +27,30 @@ const CLAUDE_DIR =
 const SESSIONS_DIR = path.join(CLAUDE_DIR, "sessions");
 const ENRICH_DIR = path.join(CLAUDE_DIR, "cc", "enrich");
 const MAILBOX_DIR = path.join(CLAUDE_DIR, "cc", "mailbox");
-const MY_SESSION_ID = process.env.CLAUDE_SESSION_ID || "";
 const POLL_INTERVAL_MS = 2000;
+
+// Discover our session ID: env var first, then match parent PID to session registry
+function discoverSessionId(): string {
+  if (process.env.CLAUDE_SESSION_ID) return process.env.CLAUDE_SESSION_ID;
+  // Walk up process tree to find a PID that matches a session file
+  let pid = process.ppid;
+  for (let i = 0; i < 5; i++) {
+    const f = path.join(SESSIONS_DIR, `${pid}.json`);
+    try {
+      const data = JSON.parse(fs.readFileSync(f, "utf-8"));
+      if (data.sessionId) return data.sessionId;
+    } catch {}
+    // Try parent's parent via ps
+    try {
+      const ppid = execSync(`ps -o ppid= -p ${pid}`, { encoding: "utf-8", timeout: 500 }).trim();
+      if (!ppid || ppid === "0" || ppid === "1") break;
+      pid = parseInt(ppid, 10);
+    } catch { break; }
+  }
+  return "";
+}
+
+const MY_SESSION_ID = discoverSessionId();
 
 // --- Types ---
 
@@ -94,9 +116,17 @@ function readLiveSessions(): Session[] {
     const pid = parseInt(f.slice(0, -5), 10);
     if (!isAlive(pid)) continue;
     try {
-      const data: SessionFile = JSON.parse(
-        fs.readFileSync(path.join(SESSIONS_DIR, f), "utf-8")
-      );
+      let raw = fs.readFileSync(path.join(SESSIONS_DIR, f), "utf-8").trim();
+      // Fix truncated JSON from Claude Code's concurrent writes
+      if (!raw.endsWith("}")) {
+        // Try to salvage: find last complete key-value pair
+        const lastBrace = raw.lastIndexOf("}");
+        if (lastBrace > 0) raw = raw.slice(0, lastBrace + 1);
+        else continue; // hopeless
+      }
+      // Remove trailing commas before closing brace
+      raw = raw.replace(/,\s*}/g, "}");
+      const data: SessionFile = JSON.parse(raw);
       let enrichFiles: string[] = [];
       let enrichTask = "";
       try {
