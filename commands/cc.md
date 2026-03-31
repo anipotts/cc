@@ -9,14 +9,13 @@ allowed-tools:
 
 # /cc
 
-Arguments: $ARGUMENTS
+Args: $ARGUMENTS
 
-If no arguments, run this single command and display its output exactly as-is:
-
+No arguments? Run this and display the output:
 ```
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/roster.sh "$(pwd)"
+python3 ${CLAUDE_PLUGIN_ROOT}/hooks/cc.py roster-cli "$(pwd)"
 ```
 
-If arguments contain a session name and message (e.g., `/cc researcher check the tests`), call the `cc_send` MCP tool with `to` as the first word and `text` as the rest.
+With `<name> <message>`? Call `cc_send` tool with `to` = first word, `text` = rest.
 
-If arguments contain just a session name (e.g., `/cc researcher`), run the roster script and highlight that session's info.
+With just `<name>`? Run the roster command and highlight that session.

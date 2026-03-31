@@ -281,6 +281,78 @@ def handle_cleanup(payload: dict) -> None:
     log(f"[cc] cleaned up {session_id[:8]}")
 
 
+def get_cpu(pid: int) -> float:
+    """Get CPU % for a PID. Returns 0.0 on any error."""
+    try:
+        out = os.popen(f"ps -p {pid} -o %cpu= 2>/dev/null").read().strip()
+        return float(out) if out else 0.0
+    except (ValueError, OSError):
+        return 0.0
+
+
+def handle_roster_cli(payload: dict) -> None:
+    """CLI roster: python3 cc.py roster-cli [cwd]
+
+    Reads Claude Code's native session registry, enriches with cc metadata.
+    Outputs formatted roster to stdout. Zero external deps.
+    """
+    my_cwd = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
+    my_project = os.path.basename(my_cwd)
+
+    sessions = read_live_sessions()
+    if not sessions:
+        print("No active sessions.")
+        return
+
+    # Add CPU + enrichment to each session
+    busy_count = 0
+    for s in sessions:
+        cpu = get_cpu(s["_pid"])
+        s["_busy"] = cpu > 5
+        if s["_busy"]:
+            busy_count += 1
+        sid = s.get("sessionId", "")
+        e = read_enrichment(sid) or {}
+        s["_files"] = e.get("files", [])
+        s["_task"] = e.get("task", "")
+
+    idle_count = len(sessions) - busy_count
+    print(f"cc — {len(sessions)} sessions ({busy_count} busy, {idle_count} idle)")
+    print()
+
+    # Group by project
+    by_proj: dict[str, list[dict]] = {}
+    for s in sessions:
+        proj = os.path.basename(s.get("cwd", ""))
+        by_proj.setdefault(proj, []).append(s)
+
+    # Sort: current project first, then by count
+    sorted_projs = sorted(by_proj.keys(), key=lambda p: (-1 if p == my_project else 0, -len(by_proj[p])))
+
+    for proj in sorted_projs:
+        members = by_proj[proj]
+        marker = "  ← YOU ARE HERE" if proj == my_project else ""
+        print(f"  {proj} ({len(members)}){marker}")
+
+        for i, m in enumerate(members):
+            conn = "└" if i == len(members) - 1 else "├"
+            status = "▶" if m.get("_busy") else "·"
+            name = m.get("name") or m.get("kind", "session")
+            name = name[:22] + "..." if len(name) > 25 else name
+            files = ", ".join(m["_files"][-3:]) if m["_files"] else ""
+            task = m["_task"]
+            task = task[:42] + "..." if len(task) > 45 else task
+
+            line = f"  {conn} {status} {name}"
+            if files:
+                line += f"  {files}"
+            if task:
+                line += f'  "{task}"'
+            print(line)
+
+        print()
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -289,18 +361,28 @@ HANDLERS = {
     "roster": handle_roster,
     "touch": handle_touch,
     "cleanup": handle_cleanup,
+    "roster-cli": handle_roster_cli,
 }
 
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} <roster|touch|cleanup>", file=sys.stderr)
+        print(f"usage: {sys.argv[0]} <roster|touch|cleanup|roster-cli>", file=sys.stderr)
         sys.exit(1)
 
     event = sys.argv[1]
     if event not in HANDLERS:
         print(f"[cc] unknown event: {event}", file=sys.stderr)
         sys.exit(1)
+
+    # roster-cli reads args, not stdin
+    if event == "roster-cli":
+        try:
+            HANDLERS[event]({})
+        except Exception as e:
+            log(f"[cc] roster-cli error: {e}")
+            sys.exit(0)
+        return
 
     try:
         payload = json.load(sys.stdin)

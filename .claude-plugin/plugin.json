@@ -1,6 +1,6 @@
 {
   "name": "cc",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "description": "Multi-session awareness for Claude Code. See what other sessions are doing, avoid file conflicts, share context across parallel sessions.",
   "author": {
     "name": "Ani Potts",
