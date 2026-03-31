@@ -1,10 +1,12 @@
 #!/usr/bin/env npx tsx
 /**
- * cc MCP server — native tools for multi-session awareness.
+ * cc MCP server — reads Claude Code's native session registry.
  *
- * Gives Claude cc_peers, cc_roster, and cc_send as first-class tools.
- * Uses /tmp/claude-{uid}/ for liveness, ~/.claude/cc/ for metadata and mailbox.
- * All writes use atomic rename. Reads from the hook's locked team files.
+ * Primary: ~/.claude/sessions/*.json (Claude Code's own concurrentSessions)
+ * Enrichment: ~/.claude/cc/enrich/{sessionId}.json (files, task from hooks)
+ * Mailbox: ~/.claude/cc/mailbox/{sessionId}.json
+ *
+ * Respects CLAUDE_CONFIG_DIR for portability.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -13,189 +15,153 @@ import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { execSync } from "child_process";
 
-const CC_DIR = path.join(os.homedir(), ".claude", "cc");
-const TEAMS_DIR = path.join(CC_DIR, "teams");
-const MAILBOX_DIR = path.join(CC_DIR, "mailbox");
-const TMP_BASE = path.join("/tmp", `claude-${process.getuid!()}`);
+const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+const SESSIONS_DIR = path.join(CLAUDE_DIR, "sessions");
+const ENRICH_DIR = path.join(CLAUDE_DIR, "cc", "enrich");
+const MAILBOX_DIR = path.join(CLAUDE_DIR, "cc", "mailbox");
 
-type TeamMember = {
-  agentId: string;
-  name: string;
+type Session = {
+  pid: number;
+  sessionId: string;
   cwd: string;
-  branch: string;
+  name?: string;
+  kind?: string;
+  startedAt?: number;
+  busy: boolean;
   files: string[];
   task: string;
-  isActive: boolean;
-  joinedAt: number;
 };
 
-type TeamFile = {
-  name: string;
-  createdAt: number;
-  members: TeamMember[];
-};
+function isProcessAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
 
-type InboxMessage = {
-  from: string;
-  text: string;
-  timestamp: string;
-  read: boolean;
-  summary?: string;
-};
-
-// --- Helpers ---
-
-function getLiveSessionIds(): Map<string, Set<string>> {
-  const result = new Map<string, Set<string>>();
-  let entries: fs.Dirent[];
+function getCpuPercent(pid: number): number {
   try {
-    entries = fs.readdirSync(TMP_BASE, { withFileTypes: true });
-  } catch {
-    return result;
-  }
-  for (const dir of entries) {
-    if (!dir.isDirectory() || !dir.name.startsWith("-")) continue;
-    const sessions = new Set<string>();
+    const out = execSync(`ps -p ${pid} -o %cpu=`, { encoding: "utf-8", timeout: 1000 });
+    return parseFloat(out.trim()) || 0;
+  } catch { return 0; }
+}
+
+function readLiveSessions(): Session[] {
+  let files: string[];
+  try { files = fs.readdirSync(SESSIONS_DIR); } catch { return []; }
+
+  const sessions: Session[] = [];
+  for (const f of files) {
+    if (!/^\d+\.json$/.test(f)) continue;
+    const pid = parseInt(f.slice(0, -5), 10);
+    if (!isProcessAlive(pid)) continue;
+
     try {
-      for (const sub of fs.readdirSync(path.join(TMP_BASE, dir.name), { withFileTypes: true })) {
-        if (sub.isDirectory()) sessions.add(sub.name);
-      }
+      const data = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), "utf-8"));
+      const sid = data.sessionId || "";
+      let enrichFiles: string[] = [];
+      let enrichTask = "";
+      try {
+        const e = JSON.parse(fs.readFileSync(path.join(ENRICH_DIR, `${sid}.json`), "utf-8"));
+        enrichFiles = e.files || [];
+        enrichTask = e.task || "";
+      } catch {}
+
+      sessions.push({
+        pid,
+        sessionId: sid,
+        cwd: data.cwd || "",
+        name: data.name,
+        kind: data.kind || "interactive",
+        startedAt: data.startedAt,
+        busy: getCpuPercent(pid) > 5,
+        files: enrichFiles,
+        task: enrichTask,
+      });
     } catch { continue; }
-    if (sessions.size > 0) result.set(dir.name, sessions);
   }
-  return result;
+  return sessions;
 }
 
-function flattenLiveIds(live: Map<string, Set<string>>): Set<string> {
-  const all = new Set<string>();
-  for (const ids of live.values()) for (const id of ids) all.add(id);
-  return all;
-}
-
-function readTeamFile(project: string): TeamFile | null {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(TEAMS_DIR, project, "config.json"), "utf-8"));
-  } catch {
-    return null;
-  }
-}
-
-function readInbox(sessionId: string): InboxMessage[] {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(MAILBOX_DIR, `${sessionId}.json`), "utf-8"));
-  } catch {
-    return [];
-  }
-}
-
-function writeInbox(sessionId: string, messages: InboxMessage[]): void {
-  fs.mkdirSync(MAILBOX_DIR, { recursive: true });
-  const p = path.join(MAILBOX_DIR, `${sessionId}.json`);
-  const tmp = `${p}.tmp.${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(messages));
-  fs.renameSync(tmp, p);
-}
-
-function findSessionByName(name: string): { sessionId: string; project: string } | null {
-  let teams: string[];
-  try {
-    teams = fs.readdirSync(TEAMS_DIR);
-  } catch {
-    return null;
-  }
-  for (const proj of teams) {
-    const team = readTeamFile(proj);
-    if (!team) continue;
-    const member = team.members.find((m) => m.name === name);
-    if (member) return { sessionId: member.agentId, project: proj };
-  }
-  return null;
+function findByName(name: string): Session | undefined {
+  return readLiveSessions().find(s => s.name === name);
 }
 
 // --- MCP Server ---
 
-const server = new McpServer({ name: "cc", version: "0.2.0" });
+const server = new McpServer({ name: "cc", version: "0.4.0" });
 
 server.tool(
   "cc_peers",
-  "Discover all live Claude Code sessions on this machine, grouped by project.",
+  "Discover all live Claude Code sessions on this machine with busy/idle status.",
   {},
   async () => {
-    const live = getLiveSessionIds();
-    const lines: string[] = [];
+    const sessions = readLiveSessions();
+    if (sessions.length === 0) return { content: [{ type: "text" as const, text: "No live sessions." }] };
 
-    for (const [encoded, sessionIds] of live) {
-      const parts = encoded.split("-").filter(Boolean);
-      const project = parts[parts.length - 1] || encoded;
-      const team = readTeamFile(project);
+    const busy = sessions.filter(s => s.busy);
+    const idle = sessions.filter(s => !s.busy);
 
-      lines.push(`${project} (${sessionIds.size} session${sessionIds.size > 1 ? "s" : ""}):`);
+    const lines = [`cc — ${sessions.length} sessions (${busy.length} busy, ${idle.length} idle)`, ""];
 
-      for (const sid of sessionIds) {
-        const member = team?.members.find((m) => m.agentId === sid);
-        if (member) {
-          const files = member.files.length > 0 ? member.files.slice(-3).join(", ") : "no files yet";
-          lines.push(`  -> ${member.name} (${member.branch || "no branch"}) editing: ${files} — "${member.task?.slice(0, 60) || ""}"`);
-        } else {
-          lines.push(`  -> ${sid.slice(0, 8)}... (no metadata yet)`);
-        }
-      }
+    // Group by project
+    const byProj = new Map<string, Session[]>();
+    for (const s of sessions) {
+      const proj = path.basename(s.cwd);
+      if (!byProj.has(proj)) byProj.set(proj, []);
+      byProj.get(proj)!.push(s);
     }
 
-    return {
-      content: [{ type: "text" as const, text: lines.length > 0 ? lines.join("\n") : "No live sessions detected." }],
-    };
+    for (const [proj, members] of byProj) {
+      lines.push(`  ${proj} (${members.length})`);
+      for (let i = 0; i < members.length; i++) {
+        const m = members[i]!;
+        const conn = i === members.length - 1 ? "└" : "├";
+        const status = m.busy ? "▶" : "·";
+        const name = m.name || m.kind || m.sessionId.slice(0, 8);
+        const filesStr = m.files.length > 0 ? `  ${m.files.slice(-3).join(", ")}` : "";
+        const taskStr = m.task ? `  "${m.task.slice(0, 50)}"` : "";
+        lines.push(`  ${conn} ${status} ${name}${filesStr}${taskStr}`);
+      }
+      lines.push("");
+    }
+
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
   }
 );
 
 server.tool(
   "cc_roster",
-  "Show the roster for a specific project — active sessions, files being edited, and file conflicts.",
-  { project: z.string().optional().describe("Project name (defaults to basename of cwd)") },
+  "Show sessions for a specific project with file conflict detection.",
+  { project: z.string().optional().describe("Project name (defaults to cwd basename)") },
   async ({ project }) => {
     const proj = project || path.basename(process.cwd());
-    const team = readTeamFile(proj);
-    const live = getLiveSessionIds();
-    const liveIds = flattenLiveIds(live);
-    const lines: string[] = [];
+    const sessions = readLiveSessions();
+    const matching = sessions.filter(s => path.basename(s.cwd) === proj);
 
-    if (!team || team.members.length === 0) {
-      const encoded = proj.replace(/\//g, "-");
-      const liveSessions = live.get(`-${encoded}`) || live.get(encoded);
-      if (liveSessions && liveSessions.size > 0) {
-        lines.push(`[cc] ${liveSessions.size} session(s) on '${proj}' (no metadata yet)`);
-      } else {
-        return { content: [{ type: "text" as const, text: `No sessions found for '${proj}'.` }] };
-      }
-    } else {
-      const alive = team.members.filter((m) => liveIds.has(m.agentId));
-      if (alive.length === 0) {
-        return { content: [{ type: "text" as const, text: `No live sessions on '${proj}'.` }] };
-      }
+    if (matching.length === 0) {
+      return { content: [{ type: "text" as const, text: `No sessions on '${proj}'.` }] };
+    }
 
-      lines.push(`[cc] ${alive.length} session(s) active on '${proj}'`);
+    const lines = [`[cc] ${matching.length} session(s) on '${proj}'`];
 
-      const fileOwners = new Map<string, string[]>();
-      for (const m of alive) {
-        for (const f of m.files) {
-          if (!fileOwners.has(f)) fileOwners.set(f, []);
-          fileOwners.get(f)!.push(m.name);
-        }
+    const fileOwners = new Map<string, string[]>();
+    for (const m of matching) {
+      for (const f of m.files) {
+        if (!fileOwners.has(f)) fileOwners.set(f, []);
+        fileOwners.get(f)!.push(m.name || m.sessionId.slice(0, 8));
       }
+    }
 
-      for (const m of alive) {
-        const branchTag = m.branch && m.branch !== "main" ? ` (${m.branch})` : "";
-        const filesStr = m.files.length > 0 ? m.files.slice(-3).join(", ") : "no files yet";
-        const taskStr = m.task ? ` — "${m.task.slice(0, 60)}"` : "";
-        lines.push(`  -> ${m.name}${branchTag} editing: ${filesStr}${taskStr}`);
-      }
+    for (const m of matching) {
+      const status = m.busy ? "▶" : "·";
+      const name = m.name || m.sessionId.slice(0, 8);
+      const filesStr = m.files.length > 0 ? m.files.slice(-3).join(", ") : "no files yet";
+      const taskStr = m.task ? ` — "${m.task.slice(0, 50)}"` : "";
+      lines.push(`  └ ${status} ${name}  ${filesStr}${taskStr}`);
+    }
 
-      for (const [file, owners] of fileOwners) {
-        if (owners.length > 1) {
-          lines.push(`  !! ${owners.join(" + ")} are both touching ${file}`);
-        }
-      }
+    for (const [file, owners] of fileOwners) {
+      if (owners.length > 1) lines.push(`  !! ${owners.join(" + ")} both touching ${file}`);
     }
 
     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
@@ -204,33 +170,34 @@ server.tool(
 
 server.tool(
   "cc_send",
-  "Send a message to another Claude Code session. They see it on their next prompt. Use cc_peers to find session names.",
+  "Send a message to another Claude Code session by name. They see it on their next prompt.",
   {
-    to: z.string().describe("Recipient session name (e.g., 'vector-seo-2')"),
+    to: z.string().describe("Recipient session name"),
     text: z.string().describe("Message content"),
     summary: z.string().optional().describe("5-10 word preview"),
   },
   async ({ to, text, summary }) => {
-    const target = findSessionByName(to);
+    const target = findByName(to);
     if (!target) {
       return { content: [{ type: "text" as const, text: `Session '${to}' not found. Use cc_peers to see available sessions.` }] };
     }
 
-    const live = getLiveSessionIds();
-    if (!flattenLiveIds(live).has(target.sessionId)) {
-      return { content: [{ type: "text" as const, text: `Session '${to}' is no longer running.` }] };
-    }
+    fs.mkdirSync(MAILBOX_DIR, { recursive: true });
+    const inboxPath = path.join(MAILBOX_DIR, `${target.sessionId}.json`);
+    let inbox: any[] = [];
+    try { inbox = JSON.parse(fs.readFileSync(inboxPath, "utf-8")); } catch {}
 
-    const mySessionId = process.env.CLAUDE_SESSION_ID || "unknown";
-    const myProject = path.basename(process.cwd());
-    const myTeam = readTeamFile(myProject);
-    const myName = myTeam?.members.find((m) => m.agentId === mySessionId)?.name || myProject;
+    const myId = process.env.CLAUDE_SESSION_ID || "unknown";
+    const sessions = readLiveSessions();
+    const me = sessions.find(s => s.sessionId === myId);
+    const myName = me?.name || path.basename(process.cwd());
 
-    const inbox = readInbox(target.sessionId);
     inbox.push({ from: myName, text, timestamp: new Date().toISOString(), read: false, summary });
-    writeInbox(target.sessionId, inbox);
+    const tmp = `${inboxPath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(inbox));
+    fs.renameSync(tmp, inboxPath);
 
-    return { content: [{ type: "text" as const, text: `Sent to ${to}. They'll see it next prompt.` }] };
+    return { content: [{ type: "text" as const, text: `Sent to ${to}.` }] };
   }
 );
 
