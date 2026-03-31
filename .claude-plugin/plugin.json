@@ -10,8 +10,8 @@
   "license": "MIT",
   "mcpServers": {
     "cc": {
-      "command": "npx",
-      "args": ["tsx", "${CLAUDE_PLUGIN_ROOT}/server.ts"]
+      "command": "bash",
+      "args": ["-c", "ln -sfn \"${CLAUDE_PLUGIN_DATA}/node_modules\" \"${CLAUDE_PLUGIN_ROOT}/node_modules\" 2>/dev/null; exec npx tsx \"${CLAUDE_PLUGIN_ROOT}/server.ts\""]
     }
   },
   "channels": [
