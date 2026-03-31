@@ -9,12 +9,9 @@ All file writes use fcntl.flock() for concurrent safety, matching
 Anthropic's proper-lockfile pattern from src/utils/teammateMailbox.ts.
 
 Events:
-  roster  — UserPromptSubmit: register self, read peers, output XML roster
+  roster  — UserPromptSubmit: register self, read peers, output roster
   touch   — PostToolUse (Edit/Write): update files list in team file
   cleanup — SessionEnd: remove self from team file
-
-stdout = visible to Claude as context
-stderr = debug logging only
 """
 
 from __future__ import annotations
@@ -52,36 +49,33 @@ def encode_cwd(cwd: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# File locking (matches Anthropic's proper-lockfile pattern)
+# File locking
 # ---------------------------------------------------------------------------
 
+_ensured_dirs: set[str] = set()
+
+
 def locked_read_modify_write(path: Path, updater, default=None):
-    """Atomic read-modify-write with file locking.
+    """Atomic read-modify-write with advisory file locking."""
+    parent = str(path.parent)
+    if parent not in _ensured_dirs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ensured_dirs.add(parent)
 
-    The updater function receives the current data and returns the new data.
-    Uses fcntl.flock for POSIX advisory locking.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(path.suffix + ".lock")
-
     with open(lock_path, "w") as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            if path.exists():
-                try:
-                    data = json.loads(path.read_text())
-                except (json.JSONDecodeError, OSError):
-                    data = default() if callable(default) else default
-            else:
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError, FileNotFoundError):
                 data = default() if callable(default) else default
 
             result = updater(data)
 
-            # Atomic write: temp file then rename
             tmp = path.with_suffix(f".tmp.{os.getpid()}")
             tmp.write_text(json.dumps(result))
             tmp.rename(path)
-
             return result
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -92,7 +86,7 @@ def locked_read_modify_write(path: Path, updater, default=None):
 # ---------------------------------------------------------------------------
 
 def get_all_live_sessions() -> dict[str, set[str]]:
-    """Scan /tmp for all live Claude Code sessions."""
+    """Scan /tmp for all live Claude Code sessions. Single scan, reuse the result."""
     if not TMP_BASE.is_dir():
         return {}
     result = {}
@@ -105,9 +99,9 @@ def get_all_live_sessions() -> dict[str, set[str]]:
     return result
 
 
-def get_all_live_ids() -> set[str]:
+def flatten_live_ids(all_live: dict[str, set[str]]) -> set[str]:
     ids: set[str] = set()
-    for s in get_all_live_sessions().values():
+    for s in all_live.values():
         ids.update(s)
     return ids
 
@@ -120,45 +114,29 @@ def team_file_path(project: str) -> Path:
     return TEAMS_DIR / project / "config.json"
 
 
-def read_team_file(project: str) -> dict | None:
-    try:
-        return json.loads(team_file_path(project).read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
 def empty_team(project: str) -> dict:
     return {"name": project, "createdAt": int(time.time()), "members": []}
 
 
 # ---------------------------------------------------------------------------
-# Mailbox operations (matches Anthropic's TeammateMessage schema)
+# Mailbox
 # ---------------------------------------------------------------------------
 
-def read_inbox(session_id: str) -> list[dict]:
+def read_unread_messages(session_id: str) -> list[dict]:
     p = MAILBOX_DIR / f"{session_id}.json"
     try:
-        return json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
+        return [m for m in json.loads(p.read_text()) if not m.get("read")]
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
         return []
-
-
-def read_unread_messages(session_id: str) -> list[dict]:
-    return [m for m in read_inbox(session_id) if not m.get("read")]
 
 
 def mark_messages_read(session_id: str) -> None:
     """Mark all messages as read (not deleted — matches Anthropic's pattern)."""
-    p = MAILBOX_DIR / f"{session_id}.json"
-    if not p.exists():
-        return
-
     def updater(messages):
         for m in messages:
             m["read"] = True
         return messages
-
-    locked_read_modify_write(p, updater, default=list)
+    locked_read_modify_write(MAILBOX_DIR / f"{session_id}.json", updater, default=list)
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +144,9 @@ def mark_messages_read(session_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def get_session_id(payload: dict) -> str:
-    """Get session ID from hook payload, env var, or /tmp scan (last resort)."""
     sid = payload.get("session_id") or os.environ.get("CLAUDE_SESSION_ID", "")
     if sid:
         return sid
-    # Last resort: if we're in a project dir, find our session from /tmp
     cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
     encoded = encode_cwd(cwd)
     tmp_dir = TMP_BASE / encoded
@@ -198,10 +174,6 @@ def get_branch(cwd: str) -> str:
 
 def get_project(cwd: str) -> str:
     return os.path.basename(cwd)
-
-
-def sanitize_id(session_id: str) -> str:
-    return session_id.replace("/", "").replace("\\", "").replace("..", "").replace("\x00", "") or "unknown"
 
 
 def make_name(project: str, branch: str, session_id: str, members: list[dict]) -> str:
@@ -237,7 +209,7 @@ def relative_time(iso_str: str) -> str:
 # ---------------------------------------------------------------------------
 
 def handle_roster(payload: dict) -> None:
-    """UserPromptSubmit: register self in team file, output XML roster."""
+    """UserPromptSubmit: register self in team file, output roster."""
     session_id = get_session_id(payload)
     if not session_id:
         log("[cc] no session_id, skipping")
@@ -245,73 +217,51 @@ def handle_roster(payload: dict) -> None:
 
     cwd = get_cwd(payload)
     project = get_project(cwd)
-    live_ids = get_all_live_ids()
+    encoded = encode_cwd(cwd)
     ts = now_iso()
 
-    # Update team file: register/update self, prune dead members
+    # Single /tmp scan — reused for liveness, unregistered detection, and cross-project
+    all_live = get_all_live_sessions()
+    live_ids = flatten_live_ids(all_live)
+
     def updater(team):
         if team is None:
             team = empty_team(project)
-
-        # Prune dead members
         team["members"] = [m for m in team["members"] if m.get("agentId") in live_ids]
-
-        # Find or create self
         self_member = next((m for m in team["members"] if m["agentId"] == session_id), None)
-
         prompt = payload.get("user_prompt", "")
         task = prompt[:120] if prompt else (self_member or {}).get("task", "")
 
         if self_member:
-            # Update existing
             self_member["task"] = task
             self_member["isActive"] = True
-            # Cache branch: only resolve on first registration
         else:
             branch = get_branch(cwd)
             name = make_name(project, branch, session_id, team["members"])
             team["members"].append({
-                "agentId": session_id,
-                "name": name,
-                "cwd": cwd,
-                "branch": branch,
-                "files": [],
-                "task": task,
-                "isActive": True,
-                "joinedAt": int(time.time()),
+                "agentId": session_id, "name": name, "cwd": cwd,
+                "branch": branch, "files": [], "task": task,
+                "isActive": True, "joinedAt": int(time.time()),
             })
-
         return team
 
     team = locked_read_modify_write(team_file_path(project), updater, default=lambda: empty_team(project))
 
-    # Get peers (everyone except self)
     peers = [m for m in team["members"] if m["agentId"] != session_id]
 
-    # Check for unregistered live sessions on same project
-    encoded = encode_cwd(cwd)
-    all_live = get_all_live_sessions()
+    # Detect live sessions on same project that haven't registered yet
     live_here = all_live.get(encoded, set())
     known_ids = {m["agentId"] for m in team["members"]}
-    unregistered = live_here - known_ids
-    for _ in unregistered:
-        peers.append({
-            "name": f"{project}-?",
-            "branch": "",
-            "files": [],
-            "task": "(just started — no metadata yet)",
-            "isActive": True,
-        })
+    for _ in live_here - known_ids:
+        peers.append({"name": f"{project}-?", "branch": "", "files": [],
+                       "task": "(just started — no metadata yet)", "isActive": True})
 
-    # Read unread messages
     messages = read_unread_messages(session_id)
 
-    # Also count sessions on OTHER projects (brief cross-project awareness)
-    all_live = get_all_live_sessions()
-    encoded = encode_cwd(cwd)
+    # Cross-project count (reuses all_live — no second scan)
     other_project_count = sum(
         len(sids) for enc, sids in all_live.items()
-        if enc != encoded and enc != "claude-501"
+        if enc != encoded and enc.startswith("-")
     )
 
     if not peers and not messages and other_project_count == 0:
@@ -324,40 +274,29 @@ def handle_roster(payload: dict) -> None:
     if peers:
         context(f"[cc] {len(peers) + 1} sessions on '{project}'")
         for peer in peers:
-            peer_name = peer.get("name", "?")
             peer_branch = peer.get("branch", "")
             peer_files = peer.get("files", [])
             peer_task = peer.get("task", "")
-
             branch_tag = f" ({peer_branch})" if peer_branch and peer_branch != my_branch else ""
             files_str = ", ".join(peer_files[-3:]) if peer_files else "no files yet"
             task_str = f' — "{peer_task[:60]}"' if peer_task else ""
+            context(f"  -> {peer.get('name', '?')}{branch_tag} editing: {files_str}{task_str}")
+            for cf in my_files & set(peer_files):
+                context(f"  !! {peer.get('name', '?')} is also touching {cf}")
 
-            context(f"  -> {peer_name}{branch_tag} editing: {files_str}{task_str}")
-
-            conflicts = my_files & set(peer_files)
-            for cf in conflicts:
-                context(f"  !! {peer_name} is also touching {cf}")
-
-    # Cross-project summary (brief — just counts)
     if other_project_count > 0:
         other_projects = []
         for enc, sids in all_live.items():
             if enc != encoded and enc.startswith("-"):
-                # Extract project name (last segment of encoded path)
                 parts = enc.strip("-").split("-")
-                proj_name = parts[-1] if parts else enc
-                other_projects.append(f"{proj_name}({len(sids)})")
+                other_projects.append(f"{parts[-1]}({len(sids)})" if parts else f"?({len(sids)})")
         if other_projects:
             context(f"[cc] also active: {', '.join(other_projects[:5])}")
 
     if messages:
         context(f"[cc] {len(messages)} message(s):")
         for msg in messages:
-            from_name = msg.get("from", "?")
-            text = msg.get("text", msg.get("content", ""))[:200]
-            context(f"  <- {from_name}: {text}")
-
+            context(f"  <- {msg.get('from', '?')}: {msg.get('text', msg.get('content', ''))[:200]}")
         mark_messages_read(session_id)
 
 
@@ -375,10 +314,7 @@ def handle_touch(payload: dict) -> None:
     cwd = get_cwd(payload)
     project = get_project(cwd)
     tf = team_file_path(project)
-    if not tf.exists():
-        return
 
-    # Make path relative
     if file_path.startswith(cwd):
         file_path = file_path[len(cwd):].lstrip("/")
 
@@ -405,12 +341,8 @@ def handle_cleanup(payload: dict) -> None:
     if not session_id:
         return
 
-    # Find which project we're in
     cwd = get_cwd(payload)
     project = get_project(cwd)
-    tf = team_file_path(project)
-    if not tf.exists():
-        return
 
     def updater(team):
         if not team:
@@ -418,13 +350,9 @@ def handle_cleanup(payload: dict) -> None:
         team["members"] = [m for m in team.get("members", []) if m.get("agentId") != session_id]
         return team
 
-    locked_read_modify_write(tf, updater)
+    locked_read_modify_write(team_file_path(project), updater)
     log(f"[cc] cleaned up session {session_id[:8]}")
 
-
-# ---------------------------------------------------------------------------
-# Dispatcher
-# ---------------------------------------------------------------------------
 
 HANDLERS = {
     "roster": handle_roster,
@@ -452,7 +380,7 @@ def main() -> None:
         HANDLERS[event](payload)
     except Exception as e:
         log(f"[cc] {event} error: {e}")
-        sys.exit(0)  # never block Claude Code
+        sys.exit(0)
 
 
 if __name__ == "__main__":
