@@ -1,11 +1,14 @@
 {
   "name": "cc",
-  "version": "0.5.0",
-  "description": "Multi-session awareness for Claude Code. See what other sessions are doing, avoid file conflicts, share context across parallel sessions.",
+  "version": "0.6.0",
+  "description": "Multi-session awareness for Claude Code. See what other sessions are doing, avoid file conflicts, share messages across parallel sessions in real-time via channels.",
   "author": {
     "name": "Ani Potts",
     "url": "https://github.com/anipotts"
   },
   "repository": "https://github.com/anipotts/cc",
-  "license": "MIT"
+  "license": "MIT",
+  "channels": [
+    { "server": "cc" }
+  ]
 }
