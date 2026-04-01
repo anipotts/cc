@@ -199,15 +199,58 @@ function writeInbox(sessionId: string, messages: InboxMessage[]): void {
   fs.renameSync(tmp, p);
 }
 
+/**
+ * Atomic read-modify-write for inbox with advisory file locking.
+ * Prevents race conditions when multiple sessions write to the same mailbox.
+ */
+function lockedInboxUpdate(
+  sessionId: string,
+  updater: (msgs: InboxMessage[]) => InboxMessage[]
+): void {
+  fs.mkdirSync(MAILBOX_DIR, { recursive: true });
+  const p = path.join(MAILBOX_DIR, `${sessionId}.json`);
+  const lockPath = `${p}.lock`;
+  const lockFd = fs.openSync(lockPath, "w");
+  try {
+    // Advisory exclusive lock (blocks until acquired)
+    const { flockSync } = require("fs-ext") as { flockSync: (fd: number, flags: string) => void };
+    flockSync(lockFd, "ex");
+  } catch {
+    // fs-ext not available — fall back to atomic rename (best-effort)
+  }
+  try {
+    let msgs: InboxMessage[] = [];
+    try {
+      msgs = JSON.parse(fs.readFileSync(p, "utf-8"));
+    } catch {}
+    const result = updater(msgs);
+    const tmp = `${p}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(result));
+    fs.renameSync(tmp, p);
+  } finally {
+    try {
+      const { flockSync } = require("fs-ext") as { flockSync: (fd: number, flags: string) => void };
+      flockSync(lockFd, "un");
+    } catch {}
+    fs.closeSync(lockFd);
+  }
+}
+
 function readUnread(sessionId: string): InboxMessage[] {
   return readInbox(sessionId).filter((m) => !m.read);
 }
 
-function markRead(sessionId: string): void {
-  const msgs = readInbox(sessionId);
-  if (msgs.length === 0) return;
-  for (const m of msgs) m.read = true;
-  writeInbox(sessionId, msgs);
+function markRead(sessionId: string, deliveredTimestamps: Set<string>): void {
+  // Only mark messages we actually delivered — prevents marking messages
+  // that arrived between read and mark as "read" without delivery
+  lockedInboxUpdate(sessionId, (msgs) => {
+    for (const m of msgs) {
+      if (!m.read && deliveredTimestamps.has(m.timestamp)) {
+        m.read = true;
+      }
+    }
+    return msgs;
+  });
 }
 
 // --- Server with channel capability ---
@@ -351,15 +394,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const me = sessions.find((s) => s.sessionId === MY_SESSION_ID);
     const myName = me?.name || path.basename(process.cwd());
 
-    const inbox = readInbox(target.sessionId);
-    inbox.push({
-      from: myName,
-      text: args.text,
-      timestamp: new Date().toISOString(),
-      read: false,
-      summary: args.summary,
+    lockedInboxUpdate(target.sessionId, (msgs) => {
+      msgs.push({
+        from: myName,
+        text: args.text,
+        timestamp: new Date().toISOString(),
+        read: false,
+        summary: args.summary,
+      });
+      return msgs;
     });
-    writeInbox(target.sessionId, inbox);
 
     return {
       content: [{ type: "text" as const, text: `Sent to ${target.name || args.to}.` }],
@@ -382,7 +426,11 @@ if (MY_SESSION_ID) {
       const unread = readUnread(MY_SESSION_ID);
       if (unread.length === 0) return;
 
-      for (const msg of unread) {
+      // Batch all messages into a single channel notification
+      // This reduces context overhead from N notifications to 1
+      const deliveredTimestamps = new Set<string>();
+      if (unread.length === 1) {
+        const msg = unread[0]!;
         server.notification({
           method: "notifications/claude/channel",
           params: {
@@ -393,8 +441,26 @@ if (MY_SESSION_ID) {
             },
           },
         });
+        deliveredTimestamps.add(msg.timestamp);
+      } else {
+        // Batch: combine into one notification
+        const lines = unread.map(
+          (m) => `${m.from}: ${m.text}`
+        );
+        const senders = [...new Set(unread.map((m) => m.from))];
+        server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: lines.join("\n"),
+            meta: {
+              from: senders.join(", "),
+              summary: `${unread.length} messages from ${senders.join(", ")}`,
+            },
+          },
+        });
+        for (const m of unread) deliveredTimestamps.add(m.timestamp);
       }
-      markRead(MY_SESSION_ID);
+      markRead(MY_SESSION_ID, deliveredTimestamps);
     } catch {
       // Non-fatal: mailbox might not exist yet
     }
