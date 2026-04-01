@@ -4,18 +4,26 @@
 Primary data source: ~/.claude/sessions/*.json (Claude Code's own registry).
 Enrichment: ~/.claude/cc/enrich/{sessionId}.json (files, task — written by hooks).
 Mailbox: ~/.claude/cc/mailbox/{sessionId}.json (cross-session messages).
+State: ~/.claude/cc/state/{sessionId}.json (roster hash + debounce timestamp).
 
 Respects CLAUDE_CONFIG_DIR for portability across all environments.
+
+Context budget strategy:
+  - Roster output is DELTA-ONLY: only emits when peers/messages change
+  - Time-debounced: skips if last check was < DEBOUNCE_SECONDS ago
+  - Enrichment writes are conditional: skips if data unchanged
+  This prevents repetitive context accumulation in long sessions.
 
 Events:
   roster  — UserPromptSubmit: read sessions, write enrichment, output roster
   touch   — PostToolUse (Edit/Write): update files in enrichment
-  cleanup — SessionEnd: remove enrichment file
+  cleanup — SessionEnd: remove enrichment + state files
 """
 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -29,7 +37,9 @@ CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
 ENRICH_DIR = CLAUDE_DIR / "cc" / "enrich"
 MAILBOX_DIR = CLAUDE_DIR / "cc" / "mailbox"
+STATE_DIR = CLAUDE_DIR / "cc" / "state"
 MAX_TRACKED_FILES = 20
+DEBOUNCE_SECONDS = 3  # skip roster if last check was this recent
 
 PID_FILE_RE = re.compile(r"^\d+\.json$")
 
@@ -150,6 +160,41 @@ def mark_read(session_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# State (delta detection + debounce)
+# ---------------------------------------------------------------------------
+
+def state_path(session_id: str) -> Path:
+    return STATE_DIR / f"{session_id}.json"
+
+
+def read_state(session_id: str) -> dict:
+    try:
+        return json.loads(state_path(session_id).read_text())
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        return {}
+
+
+def write_state(session_id: str, state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    sp = state_path(session_id)
+    tmp = sp.with_suffix(f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(state))
+    tmp.rename(sp)
+
+
+def should_debounce(session_id: str) -> bool:
+    """Return True if roster was checked too recently."""
+    st = read_state(session_id)
+    last = st.get("last_check", 0)
+    return (time.time() - last) < DEBOUNCE_SECONDS
+
+
+def roster_hash(lines: list[str]) -> str:
+    """Hash roster output to detect changes."""
+    return hashlib.md5("\n".join(lines).encode()).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -166,7 +211,14 @@ def get_cwd(payload: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def handle_roster(payload: dict) -> None:
-    """UserPromptSubmit: read sessions, write enrichment, output roster."""
+    """UserPromptSubmit: delta-only roster with debounce.
+
+    Context budget strategy:
+    1. Debounce: skip entirely if last check < DEBOUNCE_SECONDS ago
+       (unless there are unread messages — those always get delivered)
+    2. Delta-only: hash roster output, skip if identical to last emission
+    3. Conditional enrichment: only rewrite file when data actually changed
+    """
     session_id = get_session_id(payload)
     if not session_id:
         log("[cc] no session_id, skipping")
@@ -175,32 +227,43 @@ def handle_roster(payload: dict) -> None:
     cwd = get_cwd(payload)
     my_project = os.path.basename(cwd)
 
+    # Always check for messages (cheap, high-priority)
+    messages = read_unread(session_id)
+
+    # Debounce roster (but not messages)
+    if not messages and should_debounce(session_id):
+        return
+
     # Read all live sessions from Claude Code's registry
     all_sessions = read_live_sessions()
 
-    # Write/update own enrichment
+    # Conditional enrichment write: only if data changed
     prompt = payload.get("user_prompt", "")
     existing = read_enrichment(session_id) or {}
-    enrich = {
-        "files": existing.get("files", []),
-        "task": prompt[:120] if prompt else existing.get("task", ""),
-        "updated": now_iso(),
-    }
-    ENRICH_DIR.mkdir(parents=True, exist_ok=True)
-    ep = enrich_path(session_id)
-    tmp = ep.with_suffix(f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(enrich))
-    tmp.rename(ep)
+    new_task = prompt[:120] if prompt else existing.get("task", "")
+    if new_task != existing.get("task", "") or not existing:
+        enrich = {
+            "files": existing.get("files", []),
+            "task": new_task,
+            "updated": now_iso(),
+        }
+        ENRICH_DIR.mkdir(parents=True, exist_ok=True)
+        ep = enrich_path(session_id)
+        tmp = ep.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(enrich))
+        tmp.rename(ep)
+        existing = enrich
 
-    # Build roster
+    # Build roster lines
     peers = [s for s in all_sessions if s.get("sessionId") != session_id]
-    messages = read_unread(session_id)
 
     if not peers and not messages:
+        # Update state timestamp even when no output
+        write_state(session_id, {"last_check": time.time(), "last_hash": ""})
         return
 
-    # Group by project
-    my_files = set(enrich.get("files", []))
+    lines: list[str] = []
+    my_files = set(existing.get("files", []))
     same_project = []
     other_projects: dict[str, int] = {}
 
@@ -212,37 +275,48 @@ def handle_roster(payload: dict) -> None:
         else:
             other_projects[peer_proj] = other_projects.get(peer_proj, 0) + 1
 
-    # Output same-project peers
     if same_project:
-        context(f"[cc] {len(same_project) + 1} sessions on '{my_project}'")
+        lines.append(f"[cc] {len(same_project) + 1} on {my_project}")
         for peer in same_project:
             name = peer.get("name") or peer.get("sessionId", "?")[:8]
             peer_enrich = read_enrichment(peer.get("sessionId", "")) or {}
             files = peer_enrich.get("files", [])
             task = peer_enrich.get("task", "")
-            files_str = ", ".join(files[-3:]) if files else ""
-            task_str = f' — "{task[:50]}"' if task else ""
-            line = f"  └ {name}"
-            if files_str:
-                line += f"  {files_str}"
-            line += task_str
-            context(line)
+            parts = [f"  └ {name}"]
+            if files:
+                parts.append(", ".join(files[-3:]))
+            if task:
+                parts.append(f'"{task[:40]}"')
+            lines.append("  ".join(parts))
 
-            # File conflicts
+            # File conflicts (always show — these are critical)
             for cf in my_files & set(files):
-                context(f"  !! {name} is also touching {cf}")
+                lines.append(f"  !! conflict: {cf} ({name})")
 
-    # Cross-project summary
     if other_projects:
-        parts = [f"{p}({c})" for p, c in sorted(other_projects.items(), key=lambda x: -x[1])[:5]]
-        context(f"[cc] also: {', '.join(parts)}")
+        parts = [f"{p}({c})" for p, c in sorted(other_projects.items(), key=lambda x: -x[1])[:3]]
+        lines.append(f"[cc] +{', '.join(parts)}")
 
-    # Messages
+    # Delta check: skip if roster unchanged since last emission
+    st = read_state(session_id)
+    current_hash = roster_hash(lines)
+    if current_hash == st.get("last_hash", "") and not messages:
+        # Roster unchanged, no messages — suppress output
+        write_state(session_id, {"last_check": time.time(), "last_hash": current_hash})
+        return
+
+    # Emit roster
+    for line in lines:
+        context(line)
+
+    # Messages (always delivered, never suppressed)
     if messages:
-        context(f"[cc] {len(messages)} message(s):")
         for msg in messages:
-            context(f"  └ {msg.get('from', '?')}: {msg.get('text', msg.get('content', ''))[:200]}")
+            context(f"[cc] {msg.get('from', '?')}: {msg.get('text', msg.get('content', ''))[:120]}")
         mark_read(session_id)
+
+    # Update state
+    write_state(session_id, {"last_check": time.time(), "last_hash": current_hash})
 
 
 def handle_touch(payload: dict) -> None:
@@ -276,23 +350,28 @@ def handle_touch(payload: dict) -> None:
 
 
 def handle_cleanup(payload: dict) -> None:
-    """SessionEnd: remove enrichment file."""
+    """SessionEnd: remove enrichment + state files."""
     session_id = get_session_id(payload)
     if not session_id:
         return
-    try:
-        enrich_path(session_id).unlink(missing_ok=True)
-    except OSError:
-        pass
+    for p in [enrich_path(session_id), state_path(session_id)]:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
     log(f"[cc] cleaned up {session_id[:8]}")
 
 
 def get_cpu(pid: int) -> float:
     """Get CPU % for a PID. Returns 0.0 on any error."""
     try:
-        out = os.popen(f"ps -p {pid} -o %cpu= 2>/dev/null").read().strip()
+        import subprocess
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "%cpu="],
+            capture_output=True, text=True, timeout=1,
+        ).stdout.strip()
         return float(out) if out else 0.0
-    except (ValueError, OSError):
+    except (ValueError, OSError, subprocess.TimeoutExpired):
         return 0.0
 
 
