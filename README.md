@@ -1,5 +1,7 @@
 # cc: Multi-session awareness for Claude Code CLI.
 
+if this helped you, star it — it helps others find it.
+
 When you run multiple Claude Code sessions on the same machine, they don't know about each other. You end up manually relaying context between terminals. **cc** fixes that using Claude Code's own `/tmp` directories.
 
 ## What it does
@@ -88,6 +90,19 @@ cc/
 - Claude Code v2.1+
 - Python 3.10+
 - macOS or Linux
+
+## part of [claude-code-tips](https://github.com/anipotts/claude-code-tips)
+
+- [claude-code-tips](https://github.com/anipotts/claude-code-tips) — the patterns behind these tools
+- [claudemon](https://github.com/anipotts/claudemon) — real-time session monitor
+- [mine](https://github.com/anipotts/mine) — session mining to sqlite
+- [imessage-mcp](https://github.com/anipotts/imessage-mcp) — iMessage MCP server
+
+## more from me
+
+- [anipotts.com/thoughts](https://anipotts.com/thoughts) — long-form
+- [buttondown.com/anipotts](https://buttondown.com/anipotts) — newsletter
+- [@anipottsbuilds](https://instagram.com/anipottsbuilds) — short-form
 
 ## License
 
