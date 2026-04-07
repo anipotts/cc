@@ -1,6 +1,6 @@
 # cc: Multi-session awareness for Claude Code CLI.
 
-if this helped you, star it to help others find it.
+if this helped you, star it. it helps others find it.
 
 When you run multiple Claude Code sessions on the same machine, they don't know about each other. You end up manually relaying context between terminals. **cc** fixes that using Claude Code's own `/tmp` directories.
 
@@ -43,7 +43,7 @@ Every time you send a prompt, cc reminds your current session who else is workin
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Liveness detection** uses Claude Code's `/tmp` directories. These directories exist only while a session is running — when it ends (or crashes), the directory disappears. No PIDs, no heartbeats, no TTLs (near instant).
+**Liveness detection** uses Claude Code's `/tmp` directories. These directories exist only while a session is running. When it ends (or crashes), the directory disappears. No PIDs, no heartbeats, no TTLs (near instant).
 
 **Metadata** (session name, files being edited, current task) is stored in `~/.claude/cc/sessions/` as one JSON file per session. Each session writes only its own file and reads everyone else's.
 
@@ -93,16 +93,16 @@ cc/
 
 ## part of [claude-code-tips](https://github.com/anipotts/claude-code-tips)
 
-- [claude-code-tips](https://github.com/anipotts/claude-code-tips) — the patterns behind these tools
-- [claudemon](https://github.com/anipotts/claudemon) — real-time session monitor
-- [mine](https://github.com/anipotts/mine) — session mining to sqlite
-- [imessage-mcp](https://github.com/anipotts/imessage-mcp) — iMessage MCP server
+- [claude-code-tips](https://github.com/anipotts/claude-code-tips) · the patterns behind these tools
+- [claudemon](https://github.com/anipotts/claudemon) · real-time session monitor
+- [mine](https://github.com/anipotts/mine) · session mining to sqlite
+- [imessage-mcp](https://github.com/anipotts/imessage-mcp) · iMessage MCP server
 
 ## more from me
 
-- [anipotts.com/thoughts](https://anipotts.com/thoughts) — long-form
-- [buttondown.com/anipotts](https://buttondown.com/anipotts) — newsletter
-- [@anipottsbuilds](https://instagram.com/anipottsbuilds) — short-form
+- [anipotts.com/thoughts](https://anipotts.com/thoughts) · long-form
+- [buttondown.com/anipotts](https://buttondown.com/anipotts) · newsletter
+- [@anipottsbuilds](https://instagram.com/anipottsbuilds) · short-form
 
 ## License
 
