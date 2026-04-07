@@ -1,6 +1,6 @@
 # cc: Multi-session awareness for Claude Code CLI.
 
-if this helped you, star it — it helps others find it.
+if this helped you, star it to help others find it.
 
 When you run multiple Claude Code sessions on the same machine, they don't know about each other. You end up manually relaying context between terminals. **cc** fixes that using Claude Code's own `/tmp` directories.
 
